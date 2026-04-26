@@ -461,6 +461,9 @@ pub struct Tui {
     alt_screen_active: Arc<AtomicBool>,
     // True when terminal/tab is focused; updated internally from crossterm events
     terminal_focused: Arc<AtomicBool>,
+    // Set when focus returns so the next draw repaints terminal graphics that may live outside
+    // the normal text buffer.
+    terminal_focus_repaint_pending: Arc<AtomicBool>,
     enhanced_keys_supported: bool,
     notification_backend: Option<DesktopNotificationBackend>,
     notification_condition: NotificationCondition,
@@ -497,6 +500,7 @@ impl Tui {
             suspend_context: SuspendContext::new(),
             alt_screen_active: Arc::new(AtomicBool::new(false)),
             terminal_focused: Arc::new(AtomicBool::new(true)),
+            terminal_focus_repaint_pending: Arc::new(AtomicBool::new(false)),
             enhanced_keys_supported,
             notification_backend: Some(detect_backend(NotificationMethod::default())),
             notification_condition: NotificationCondition::default(),
@@ -615,6 +619,7 @@ impl Tui {
             self.event_broker.clone(),
             self.draw_tx.subscribe(),
             self.terminal_focused.clone(),
+            self.terminal_focus_repaint_pending.clone(),
             self.suspend_context.clone(),
             self.alt_screen_active.clone(),
         );
@@ -623,6 +628,7 @@ impl Tui {
             self.event_broker.clone(),
             self.draw_tx.subscribe(),
             self.terminal_focused.clone(),
+            self.terminal_focus_repaint_pending.clone(),
         );
         Box::pin(stream)
     }
@@ -741,11 +747,24 @@ impl Tui {
             return Ok(false);
         }
 
-        crate::insert_history::insert_history_lines_with_mode(
-            terminal,
-            pending_history_lines.clone(),
-            crate::insert_history::InsertHistoryMode::new(is_zellij),
-        )?;
+        let batches = split_history_lines_for_sixel_render(pending_history_lines);
+        let should_flush_between_batches = batches.len() > 1;
+        if should_flush_between_batches {
+            crate::sixel_history::sixel_debug_log(format_args!(
+                "insert-history-split batches={}",
+                batches.len()
+            ));
+        }
+        for batch in batches {
+            crate::insert_history::insert_history_lines_with_mode(
+                terminal,
+                batch,
+                crate::insert_history::InsertHistoryMode::new(is_zellij),
+            )?;
+            if should_flush_between_batches {
+                std::io::Write::flush(terminal.backend_mut())?;
+            }
+        }
         pending_history_lines.clear();
         Ok(is_zellij)
     }
@@ -785,6 +804,9 @@ impl Tui {
                 &mut self.pending_history_lines,
                 self.is_zellij,
             )?;
+            needs_full_repaint |= self
+                .terminal_focus_repaint_pending
+                .swap(false, Ordering::Relaxed);
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
@@ -831,4 +853,40 @@ impl Tui {
         }
         Ok(None)
     }
+}
+
+fn split_history_lines_for_sixel_render(lines: &[Line<'static>]) -> Vec<Vec<Line<'static>>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        let line = &lines[index];
+        let is_redraw_sixel =
+            crate::sixel_history::sixel_history_image_with_prefix_width_from_line(line)
+                .is_some_and(|(image, _)| image.redraw_on_scroll);
+
+        current.push(line.clone());
+        index += 1;
+
+        if is_redraw_sixel {
+            while index < lines.len()
+                && crate::sixel_history::is_sixel_history_reserve_line(&lines[index])
+            {
+                current.push(lines[index].clone());
+                index += 1;
+            }
+            batches.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    if batches.is_empty() {
+        batches.push(Vec::new());
+    }
+
+    batches
 }

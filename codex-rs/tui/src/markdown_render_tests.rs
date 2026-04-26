@@ -1,4 +1,5 @@
 use pretty_assertions::assert_eq;
+use ratatui::style::Color;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -9,10 +10,24 @@ use crate::markdown_render::COLON_LOCATION_SUFFIX_RE;
 use crate::markdown_render::HASH_LOCATION_SUFFIX_RE;
 use crate::markdown_render::render_markdown_text;
 use crate::markdown_render::render_markdown_text_with_width_and_cwd;
+use crate::sixel_history::sixel_history_image_from_line;
+use base64::Engine;
 use insta::assert_snapshot;
 
 fn render_markdown_text_for_cwd(input: &str, cwd: &Path) -> Text<'static> {
     render_markdown_text_with_width_and_cwd(input, /*width*/ None, Some(cwd))
+}
+
+fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
+    text.lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.clone())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 #[test]
@@ -833,6 +848,259 @@ fn markdown_render_file_link_snapshot() {
         .join("\n");
 
     assert_snapshot!(rendered);
+}
+
+#[test]
+fn table_renders_grid() {
+    let text = render_markdown_text("| Left | Right |\n|------|------:|\n| a | b |\n");
+    assert_eq!(
+        lines_to_strings(&text),
+        vec![
+            "┌──────┬───────┐".to_string(),
+            "│ Left │ Right │".to_string(),
+            "├──────┼───────┤".to_string(),
+            "│ a    │     b │".to_string(),
+            "└──────┴───────┘".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn table_header_text_is_yellow() {
+    let text = render_markdown_text("| Left | Right |\n|------|------:|\n| a | b |\n");
+    let header_line = text.lines.get(1).expect("header row should render");
+    let body_line = text.lines.get(3).expect("body row should render");
+
+    assert!(
+        header_line
+            .spans
+            .iter()
+            .filter(|span| span.content.contains("Left") || span.content.contains("Right"))
+            .all(|span| span.style.fg == Some(Color::Yellow)),
+        "expected table header text to be yellow"
+    );
+    assert!(
+        body_line
+            .spans
+            .iter()
+            .filter(|span| span.content.contains('a') || span.content.contains('b'))
+            .all(|span| span.style.fg != Some(Color::Yellow)),
+        "expected table body text to keep its original foreground"
+    );
+}
+
+#[test]
+fn table_wraps_long_cells_to_fit_width() {
+    let text = render_markdown_text_with_width_and_cwd(
+        "| Left | Right |\n|------|------:|\n| very long table cell content that should wrap | b |\n",
+        Some(24),
+        None,
+    );
+    assert!(
+        text.lines.iter().all(|line| line.width() <= 24),
+        "expected wrapped table to fit width: {:?}",
+        lines_to_strings(&text)
+    );
+}
+
+#[test]
+fn table_renders_multiple_body_rows_without_column_merging() {
+    let text = render_markdown_text(
+        "| 步骤 | 负责人 | 状态 | 说明 |\n| --- | --- | --- | --- |\n| 需求确认 | 产品 | 已完成 | 明确目标和范围 |\n| 页面设计 | 设计 | 进行中 | 输出界面草图 |\n| 功能开发 | 开发 | 未开始 | 编写核心逻辑 |\n| 测试验收 | 测试 | 未开始 | 验证功能是否符合预期 |\n",
+    );
+    assert_eq!(
+        lines_to_strings(&text),
+        vec![
+            "┌──────────┬────────┬────────┬──────────────────────┐".to_string(),
+            "│ 步骤     │ 负责人 │ 状态   │ 说明                 │".to_string(),
+            "├──────────┼────────┼────────┼──────────────────────┤".to_string(),
+            "│ 需求确认 │ 产品   │ 已完成 │ 明确目标和范围       │".to_string(),
+            "├──────────┼────────┼────────┼──────────────────────┤".to_string(),
+            "│ 页面设计 │ 设计   │ 进行中 │ 输出界面草图         │".to_string(),
+            "├──────────┼────────┼────────┼──────────────────────┤".to_string(),
+            "│ 功能开发 │ 开发   │ 未开始 │ 编写核心逻辑         │".to_string(),
+            "├──────────┼────────┼────────┼──────────────────────┤".to_string(),
+            "│ 测试验收 │ 测试   │ 未开始 │ 验证功能是否符合预期 │".to_string(),
+            "└──────────┴────────┴────────┴──────────────────────┘".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn consecutive_tables_render_as_distinct_blocks() {
+    let text = render_markdown_text(
+        "| A | B |\n| --- | --- |\n| 1 | 2 |\n| C | D |\n| --- | --- |\n| 3 | 4 |\n",
+    );
+    assert_eq!(
+        lines_to_strings(&text),
+        vec![
+            "┌───┬───┐".to_string(),
+            "│ A │ B │".to_string(),
+            "├───┼───┤".to_string(),
+            "│ 1 │ 2 │".to_string(),
+            "└───┴───┘".to_string(),
+            "".to_string(),
+            "┌───┬───┐".to_string(),
+            "│ C │ D │".to_string(),
+            "├───┼───┤".to_string(),
+            "│ 3 │ 4 │".to_string(),
+            "└───┴───┘".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn markdown_render_local_image_uses_sixel_preview() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let image_path = tempdir.path().join("sample.png");
+    let mut image = image::RgbaImage::new(24, 24);
+    for (_x, y, pixel) in image.enumerate_pixels_mut() {
+        *pixel = if y < 12 {
+            image::Rgba([255, 0, 0, 255])
+        } else {
+            image::Rgba([0, 0, 255, 255])
+        };
+    }
+    image.save(&image_path).expect("test image should be saved");
+
+    let text = render_markdown_text_with_width_and_cwd(
+        "![alt text](sample.png)",
+        Some(20),
+        Some(tempdir.path()),
+    );
+    let image = text
+        .lines
+        .iter()
+        .find_map(sixel_history_image_from_line)
+        .expect("markdown image should render as sixel");
+
+    assert_eq!(image.columns, 20);
+    assert_eq!(image.rows, 10);
+    assert!(!image.redraw_on_scroll);
+    assert!(!lines_to_strings(&text).join("\n").contains("alt text"));
+}
+
+#[test]
+fn markdown_render_file_url_image_uses_sixel_preview() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let image_path = tempdir.path().join("sample-file-url.png");
+    let image = image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 128, 255, 255]));
+    image.save(&image_path).expect("test image should be saved");
+    let url = url::Url::from_file_path(&image_path).expect("file URL should be created");
+
+    let markdown = format!("![file alt]({url})");
+    let text = render_markdown_text_with_width_and_cwd(&markdown, Some(20), None);
+    let image = text
+        .lines
+        .iter()
+        .find_map(sixel_history_image_from_line)
+        .expect("file URL markdown image should render as sixel");
+
+    assert_eq!(image.columns, 20);
+    assert_eq!(image.rows, 10);
+    assert!(!lines_to_strings(&text).join("\n").contains("file alt"));
+}
+
+#[test]
+fn markdown_render_files_url_image_uses_sixel_preview() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let image_path = tempdir.path().join("sample-files-url.png");
+    let image = image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 128, 255, 255]));
+    image.save(&image_path).expect("test image should be saved");
+    let markdown = format!("![files alt](files:{})", image_path.display());
+
+    let text = render_markdown_text_with_width_and_cwd(&markdown, Some(20), None);
+    let image = text
+        .lines
+        .iter()
+        .find_map(sixel_history_image_from_line)
+        .expect("files URL markdown image should render as sixel");
+
+    assert_eq!(image.columns, 20);
+    assert_eq!(image.rows, 10);
+    assert!(!lines_to_strings(&text).join("\n").contains("files alt"));
+}
+
+#[test]
+fn markdown_render_http_image_uses_sixel_preview() {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let image_path = tempdir.path().join("sample-http.png");
+    let image = image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 128, 255, 255]));
+    image.save(&image_path).expect("test image should be saved");
+    let bytes = std::fs::read(image_path).expect("test image should be readable");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    listener
+        .set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for http client"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("http client should connect: {error}"),
+            }
+        };
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .expect("headers should write");
+        stream.write_all(&bytes).expect("body should write");
+    });
+
+    let markdown = format!("![remote alt](http://{address}/sample-http.png)");
+    let text = render_markdown_text_with_width_and_cwd(&markdown, Some(20), None);
+    server.join().expect("server thread should finish");
+    let image = text
+        .lines
+        .iter()
+        .find_map(sixel_history_image_from_line)
+        .expect("http markdown image should render as sixel");
+
+    assert_eq!(image.columns, 20);
+    assert_eq!(image.rows, 10);
+    assert!(!lines_to_strings(&text).join("\n").contains("remote alt"));
+}
+
+#[test]
+fn markdown_render_data_image_uses_sixel_preview() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let image_path = tempdir.path().join("sample.png");
+    let image = image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 128, 255, 255]));
+    image.save(&image_path).expect("test image should be saved");
+    let bytes = std::fs::read(image_path).expect("test image should be readable");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let markdown = format!("![蓝天白云](data:image/png;base64,{encoded})");
+
+    let text = render_markdown_text_with_width_and_cwd(&markdown, Some(20), None);
+    let image = text
+        .lines
+        .iter()
+        .find_map(sixel_history_image_from_line)
+        .expect("data URL markdown image should render as sixel");
+
+    assert_eq!(image.columns, 20);
+    assert_eq!(image.rows, 10);
+    assert!(!lines_to_strings(&text).join("\n").contains("蓝天白云"));
 }
 
 #[test]

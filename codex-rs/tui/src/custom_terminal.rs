@@ -45,37 +45,95 @@ use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
-/// Returns the display width of a cell symbol, ignoring OSC escape sequences.
-///
-/// OSC sequences (e.g. OSC 8 hyperlinks: `\x1B]8;;URL\x07`) are terminal
-/// control sequences that don't consume display columns.  The standard
-/// `UnicodeWidthStr::width()` method incorrectly counts the printable
-/// characters inside OSC payloads (like `]`, `8`, `;`, and URL characters).
-/// This function strips them first so that only visible characters contribute
-/// to the width.
+use crate::insert_history::clear_visible_sixel_graphics;
+use crate::sixel_history::sixel_debug_log;
+
+/// Returns the display width of a cell symbol, ignoring terminal control sequences.
 fn display_width(s: &str) -> usize {
     // Fast path: no escape sequences present.
-    if !s.contains('\x1B') {
+    if !s.contains('\x1B')
+        && !s.contains('\u{90}')
+        && !s.contains('\u{9b}')
+        && !s.contains('\u{9d}')
+    {
         return s.width();
     }
 
-    // Strip OSC sequences: ESC ] ... BEL
     let mut visible = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\x1B' && chars.clone().next() == Some(']') {
-            // Consume the ']' and everything up to and including BEL.
-            chars.next(); // skip ']'
-            for c in chars.by_ref() {
-                if c == '\x07' {
-                    break;
+        match ch {
+            '\x1B' => match chars.peek().copied() {
+                Some(']') => {
+                    chars.next();
+                    skip_until_osc_end(&mut chars);
                 }
-            }
-            continue;
+                Some('P') => {
+                    chars.next();
+                    skip_until_string_terminator(&mut chars);
+                }
+                Some('[') => {
+                    chars.next();
+                    skip_until_csi_final_byte(&mut chars);
+                }
+                Some('7' | '8' | '\\') => {
+                    chars.next();
+                }
+                Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
+                    chars.next();
+                    chars.next();
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\u{90}' => skip_until_string_terminator(&mut chars),
+            '\u{9b}' => skip_until_csi_final_byte(&mut chars),
+            '\u{9d}' => skip_until_osc_end(&mut chars),
+            _ => visible.push(ch),
         }
-        visible.push(ch);
     }
     visible.width()
+}
+
+fn symbol_has_terminal_side_effects(symbol: &str) -> bool {
+    symbol.contains("\x1bP")
+        || symbol.contains('\u{90}')
+        || symbol.contains("\x1b7")
+        || symbol.contains("\x1b8")
+}
+
+fn skip_until_osc_end(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = chars.next() {
+        if ch == '\x07' || ch == '\u{9c}' {
+            break;
+        }
+        if ch == '\x1B' && chars.peek().copied() == Some('\\') {
+            chars.next();
+            break;
+        }
+    }
+}
+
+fn skip_until_string_terminator(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = chars.next() {
+        if ch == '\u{9c}' {
+            break;
+        }
+        if ch == '\x1B' && chars.peek().copied() == Some('\\') {
+            chars.next();
+            break;
+        }
+    }
+}
+
+fn skip_until_csi_final_byte(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            break;
+        }
+    }
 }
 
 #[derive(Debug, Hash)]
@@ -451,11 +509,13 @@ where
     /// Clear the entire visible screen (not just the viewport) and force a full redraw.
     pub fn clear_visible_screen(&mut self) -> io::Result<()> {
         let home = Position { x: 0, y: 0 };
+        let screen_size = self.size().unwrap_or(self.last_known_screen_size);
         // Some terminals (notably Terminal.app) behave more reliably if we pair ED2
         // with an explicit cursor-home before/after, matching the common `clear`
         // sequence (`CSI 2J` + `CSI H`).
         self.set_cursor_position(home)?;
         self.backend.clear_region(ClearType::All)?;
+        clear_visible_sixel_graphics(&mut self.backend, screen_size)?;
         self.set_cursor_position(home)?;
         std::io::Write::flush(&mut self.backend)?;
         self.visible_history_rows = 0;
@@ -471,10 +531,12 @@ where
         if self.viewport_area.is_empty() {
             return Ok(());
         }
+        let screen_size = self.size().unwrap_or(self.last_known_screen_size);
 
         // Reset scroll region + style state, home cursor, clear screen, purge scrollback.
         // The order matches the common shell `clear && printf '\\e[3J'` behavior.
         write!(self.backend, "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
+        clear_visible_sixel_graphics(&mut self.backend, screen_size)?;
         std::io::Write::flush(&mut self.backend)?;
         self.last_known_cursor_pos = Position { x: 0, y: 0 };
         self.visible_history_rows = 0;
@@ -555,10 +617,24 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
     let mut to_skip: usize = 0;
     for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
+        let has_side_effects = symbol_has_terminal_side_effects(current.symbol());
+        if !current.skip
+            && (current != previous || invalidated > 0 || has_side_effects)
+            && to_skip == 0
+        {
             let (x, y) = a.pos_of(i);
             let row = i / a.area.width as usize;
             if x <= last_nonblank_columns[row] {
+                if has_side_effects {
+                    sixel_debug_log(format_args!(
+                        "terminal-diff-side-effect-put x={} y={} changed={} invalidated={} bytes={}",
+                        x,
+                        y,
+                        current != previous,
+                        invalidated,
+                        current.symbol().len()
+                    ));
+                }
                 updates.push(DrawCommand::Put {
                     x,
                     y,
@@ -598,7 +674,18 @@ where
         last_pos = Some(Position { x, y });
         match command {
             DrawCommand::Put { cell, .. } => {
-                if cell.modifier != modifier {
+                let symbol_moves_cursor = symbol_has_terminal_side_effects(cell.symbol());
+                if symbol_moves_cursor {
+                    queue!(
+                        writer,
+                        SetForegroundColor(crossterm::style::Color::Reset),
+                        SetBackgroundColor(crossterm::style::Color::Reset),
+                        SetAttribute(crossterm::style::Attribute::Reset),
+                    )?;
+                    fg = Color::Reset;
+                    bg = Color::Reset;
+                    modifier = Modifier::empty();
+                } else if cell.modifier != modifier {
                     let diff = ModifierDiff {
                         from: modifier,
                         to: cell.modifier,
@@ -606,7 +693,7 @@ where
                     diff.queue(writer)?;
                     modifier = cell.modifier;
                 }
-                if cell.fg != fg || cell.bg != bg {
+                if !symbol_moves_cursor && (cell.fg != fg || cell.bg != bg) {
                     queue!(
                         writer,
                         SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
@@ -616,6 +703,18 @@ where
                 }
 
                 queue!(writer, Print(cell.symbol()))?;
+                if symbol_moves_cursor {
+                    queue!(
+                        writer,
+                        SetForegroundColor(crossterm::style::Color::Reset),
+                        SetBackgroundColor(crossterm::style::Color::Reset),
+                        SetAttribute(crossterm::style::Attribute::Reset),
+                    )?;
+                    fg = Color::Reset;
+                    bg = Color::Reset;
+                    modifier = Modifier::empty();
+                    last_pos = None;
+                }
             }
             DrawCommand::ClearToEnd { bg: clear_bg, .. } => {
                 queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
@@ -754,6 +853,95 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. })),
             "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn display_width_ignores_sixel_and_cursor_control_sequences() {
+        assert_eq!(display_width("\x1bPqdata\x1b\\"), 0);
+        assert_eq!(
+            display_width("\x1b7\x1b[?8452h\x1bPqdata\x1b\\\x1b[?8452l\x1b8X"),
+            1
+        );
+    }
+
+    #[test]
+    fn diff_buffers_does_not_treat_sixel_data_as_visible_columns() {
+        let area = Rect::new(0, 0, 3, 1);
+        let previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+
+        next.cell_mut((0, 0))
+            .expect("cell should exist")
+            .set_symbol("\x1bPqdata\x1b\\");
+        next.cell_mut((1, 0))
+            .expect("cell should exist")
+            .set_symbol("X");
+
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Put { x: 1, y: 0, .. })),
+            "expected diff_buffers to update the cell after sixel output; commands: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn diff_buffers_reemits_unchanged_sixel_control_sequences() {
+        let area = Rect::new(0, 0, 3, 1);
+        let mut previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+
+        previous
+            .cell_mut((0, 0))
+            .expect("cell should exist")
+            .set_symbol("\x1b7\x1b[3X\x1b8");
+        next.cell_mut((0, 0))
+            .expect("cell should exist")
+            .set_symbol("\x1b7\x1b[3X\x1b8");
+
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Put { x: 0, y: 0, .. })),
+            "expected unchanged sixel clear sequence to be re-emitted; commands: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn draw_repositions_after_sixel_control_sequence() {
+        let mut sixel_cell = Cell::default();
+        sixel_cell.set_symbol("\x1b7\x1bPqdata\x1b\\\x1b8");
+        let mut text_cell = Cell::default();
+        text_cell.set_symbol("X");
+
+        let mut output = Vec::new();
+        draw(
+            &mut output,
+            vec![
+                DrawCommand::Put {
+                    x: 0,
+                    y: 0,
+                    cell: sixel_cell,
+                },
+                DrawCommand::Put {
+                    x: 1,
+                    y: 0,
+                    cell: text_cell,
+                },
+            ]
+            .into_iter(),
+        )
+        .expect("draw should succeed");
+
+        let output = String::from_utf8(output).expect("draw output should be utf8");
+        assert!(
+            output.contains("\x1b[1;2H"),
+            "expected explicit cursor move before the cell after sixel output; output={output:?}",
         );
     }
 }

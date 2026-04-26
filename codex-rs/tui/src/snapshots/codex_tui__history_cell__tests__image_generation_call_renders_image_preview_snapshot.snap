@@ -1,0 +1,19 @@
+---
+source: tui/src/history_cell.rs
+expression: rendered
+---
+• Generated Image:
+  └ A tiny checkerboard
+  └ Saved to: file:///tmp/generated-preview.png
+  └ Preview:
+
+    <sixel image cols=20 rows=10>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>
+    <sixel image reserve>

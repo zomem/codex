@@ -46,10 +46,13 @@ impl MarkdownStreamCollector {
         let source = self.buffer.clone();
         let last_newline_idx = source.rfind('\n');
         let source = if let Some(last_newline_idx) = last_newline_idx {
-            source[..=last_newline_idx].to_string()
+            stable_prefix_for_stream_commit(&source[..=last_newline_idx]).to_string()
         } else {
             return Vec::new();
         };
+        if source.is_empty() {
+            return Vec::new();
+        }
         let mut rendered: Vec<Line<'static>> = Vec::new();
         markdown::append_markdown(&source, self.width, Some(self.cwd.as_path()), &mut rendered);
         let mut complete_line_count = rendered.len();
@@ -104,6 +107,136 @@ impl MarkdownStreamCollector {
         self.clear();
         out
     }
+}
+
+fn stable_prefix_for_stream_commit(source: &str) -> &str {
+    let lines = source
+        .split_inclusive('\n')
+        .scan(0usize, |offset, line| {
+            let start = *offset;
+            *offset += line.len();
+            Some((start, line))
+        })
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut active_fence: Option<(char, usize, usize)> = None;
+
+    while index < lines.len() {
+        let (line_without_newline, _) = strip_trailing_newline(lines[index].1);
+
+        if let Some((marker, marker_len, _start)) = active_fence {
+            if let Some((candidate_marker, candidate_len)) =
+                parse_fence_marker(line_without_newline)
+                && candidate_marker == marker
+                && candidate_len >= marker_len
+            {
+                active_fence = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some((marker, marker_len)) = parse_fence_marker(line_without_newline) {
+            active_fence = Some((marker, marker_len, lines[index].0));
+            index += 1;
+            continue;
+        }
+
+        if starts_table_at(&lines, index) {
+            let table_start = lines[index].0;
+            index += 2;
+
+            while index < lines.len() {
+                if starts_table_at(&lines, index) {
+                    break;
+                }
+
+                if !is_table_row_candidate(strip_trailing_newline(lines[index].1).0) {
+                    break;
+                }
+
+                index += 1;
+            }
+
+            if index == lines.len() {
+                return &source[..table_start];
+            }
+            continue;
+        }
+
+        if index + 1 == lines.len() && is_table_row_candidate(line_without_newline) {
+            return &source[..lines[index].0];
+        }
+
+        index += 1;
+    }
+
+    if let Some((_marker, _marker_len, start)) = active_fence {
+        return &source[..start];
+    }
+
+    source
+}
+
+fn starts_table_at(lines: &[(usize, &str)], index: usize) -> bool {
+    index + 1 < lines.len()
+        && is_table_row_candidate(strip_trailing_newline(lines[index].1).0)
+        && is_table_delimiter_line(strip_trailing_newline(lines[index + 1].1).0)
+}
+
+fn strip_trailing_newline(line: &str) -> (&str, bool) {
+    if let Some(stripped) = line.strip_suffix('\n') {
+        (stripped, true)
+    } else {
+        (line, false)
+    }
+}
+
+fn parse_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len().saturating_sub(trimmed.len());
+    if indent > 3 || trimmed.is_empty() {
+        return None;
+    }
+
+    let marker = match trimmed.as_bytes().first().copied() {
+        Some(b'`') => '`',
+        Some(b'~') => '~',
+        _ => return None,
+    };
+    let run_len = trimmed.chars().take_while(|ch| *ch == marker).count();
+    if run_len < 3 {
+        return None;
+    }
+
+    Some((marker, run_len))
+}
+
+fn is_table_row_candidate(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.contains('|')
+}
+
+fn is_table_delimiter_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.contains('|') {
+        return false;
+    }
+
+    let mut saw_valid_segment = false;
+    for segment in trimmed.trim_matches('|').split('|') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        if segment.len() < 3 || !segment.chars().all(|ch| ch == '-' || ch == ':') {
+            return false;
+        }
+        saw_valid_segment = true;
+    }
+
+    saw_valid_segment
 }
 
 #[cfg(test)]
@@ -721,5 +854,31 @@ mod tests {
             "more stuff\n",
         ])
         .await;
+    }
+
+    #[tokio::test]
+    async fn streaming_table_matches_full_render_without_raw_pipe_rows() {
+        let deltas = [
+            "下面是一个示例表格：\n\n",
+            "| 项目 | 状态 | 说明 |\n",
+            "|---|---:|---|\n",
+            "| Markdown 表格渲染 | 已完成 | 支持边框、对齐和换行 |\n",
+            "| Release 编译 | 已完成 | 二进制已生成 |\n",
+            "| 验证 | 通过 | 版本输出正常 |\n",
+        ];
+        assert_streamed_equals_full(&deltas).await;
+
+        let streamed = simulate_stream_markdown_for_tests(&deltas, /*finalize*/ true);
+        let streamed_strs = lines_to_plain_strings(&streamed);
+        assert!(
+            streamed_strs.iter().any(|line| line.starts_with('┌')),
+            "expected boxed table border: {streamed_strs:?}"
+        );
+        assert!(
+            streamed_strs
+                .iter()
+                .all(|line| !line.trim_start().starts_with('|')),
+            "raw pipe table rows should not be committed before the table closes: {streamed_strs:?}"
+        );
     }
 }

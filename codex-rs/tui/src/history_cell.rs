@@ -19,6 +19,8 @@ use crate::exec_cell::output_lines;
 use crate::exec_cell::spinner;
 use crate::exec_command::relativize_to_home;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::image_preview::local_image_preview_cache_key;
+use crate::image_preview::render_local_image_preview_to_lines;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::web_search_detail;
 use crate::live_wrap::take_prefix_by_width;
@@ -27,6 +29,11 @@ use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
 use crate::render::renderable::Renderable;
+use crate::sixel_history::is_sixel_history_reserve_line;
+use crate::sixel_history::sixel_clear_area_sequence;
+use crate::sixel_history::sixel_debug_log;
+use crate::sixel_history::sixel_history_image_from_line;
+use crate::sixel_history::sixel_history_image_with_prefix_width_from_line;
 use crate::style::proposed_plan_style;
 use crate::style::user_message_style;
 #[cfg(test)]
@@ -99,6 +106,22 @@ pub(crate) use hook_cell::HookCell;
 pub(crate) use hook_cell::new_active_hook_cell;
 pub(crate) use hook_cell::new_completed_hook_cell;
 
+enum HistoryRenderItem {
+    Text {
+        line: Line<'static>,
+        height: usize,
+    },
+    Sixel {
+        cell_size: crate::sixel_history::SixelCellSize,
+        clear_background: (u8, u8, u8),
+        data: String,
+        columns: u16,
+        is_tmux: bool,
+        rows: u16,
+        prefix_width: u16,
+    },
+}
+
 /// Represents an event to display in the conversation history. Returns its
 /// `Vec<Line<'static>>` representation to make it easier to display in a
 /// scrollable list.
@@ -123,11 +146,7 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     /// for lines containing URL-like tokens that are wider than the
     /// terminal — the logical line count would undercount.
     fn desired_height(&self, width: u16) -> u16 {
-        Paragraph::new(Text::from(self.display_lines(width)))
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .try_into()
-            .unwrap_or(0)
+        history_lines_height(self.display_lines(width), width)
     }
 
     /// Returns lines for the transcript overlay (`Ctrl+T`).
@@ -157,11 +176,7 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
             return 1;
         }
 
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .try_into()
-            .unwrap_or(0)
+        history_lines_height(lines, width)
     }
 
     fn is_stream_continuation(&self) -> bool {
@@ -186,6 +201,11 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 impl Renderable for Box<dyn HistoryCell> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let lines = self.display_lines(area.width);
+        if lines_contain_sixel_history_image(&lines) {
+            render_lines_with_sixel_history_images(&lines, area, buf);
+            return;
+        }
+
         let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         let y = if area.height == 0 {
             0
@@ -199,6 +219,220 @@ impl Renderable for Box<dyn HistoryCell> {
     }
     fn desired_height(&self, width: u16) -> u16 {
         HistoryCell::desired_height(self.as_ref(), width)
+    }
+}
+
+fn lines_contain_sixel_history_image(lines: &[Line<'_>]) -> bool {
+    lines
+        .iter()
+        .any(|line| sixel_history_image_from_line(line).is_some())
+}
+
+fn history_lines_height(lines: Vec<Line<'static>>, width: u16) -> u16 {
+    if lines_contain_sixel_history_image(&lines) {
+        let (_, total_height) = prepare_history_render_items(&lines, width);
+        return u16::try_from(total_height).unwrap_or(u16::MAX);
+    }
+
+    Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .try_into()
+        .unwrap_or(0)
+}
+
+fn render_lines_with_sixel_history_images(lines: &[Line<'static>], area: Rect, buf: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let (items, total_height) = prepare_history_render_items(lines, area.width);
+    let item_count = items.len();
+    let clear_context = items.iter().find_map(|item| match item {
+        HistoryRenderItem::Sixel {
+            cell_size,
+            clear_background,
+            is_tmux,
+            ..
+        } => Some((*cell_size, *clear_background, *is_tmux)),
+        HistoryRenderItem::Text { .. } => None,
+    });
+    let mut scrolled_rows = total_height.saturating_sub(usize::from(area.height));
+    sixel_debug_log(format_args!(
+        "history-render area={}x{} total_height={} initial_scroll={} items={}",
+        area.width, area.height, total_height, scrolled_rows, item_count
+    ));
+    let mut y = area.y;
+
+    for item in items {
+        if y >= area.bottom() {
+            break;
+        }
+
+        let item_height = item.height();
+        if scrolled_rows >= item_height {
+            scrolled_rows -= item_height;
+            continue;
+        }
+
+        let local_scroll = scrolled_rows;
+        scrolled_rows = 0;
+        let visible_height = item_height.saturating_sub(local_scroll);
+        let render_height = visible_height.min(usize::from(area.bottom().saturating_sub(y)));
+        if render_height == 0 {
+            continue;
+        }
+
+        match item {
+            HistoryRenderItem::Text { line, .. } => {
+                let rect = Rect::new(
+                    area.x,
+                    y,
+                    area.width,
+                    u16::try_from(render_height).unwrap_or(0),
+                );
+                let scroll_y = u16::try_from(local_scroll).unwrap_or(u16::MAX);
+                Paragraph::new(Text::from(vec![line]))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_y, 0))
+                    .render(rect, buf);
+            }
+            HistoryRenderItem::Sixel {
+                cell_size,
+                clear_background,
+                data,
+                columns,
+                is_tmux,
+                rows,
+                prefix_width,
+            } => {
+                let x_offset = prefix_width.min(area.width);
+                let visible_width = area.width.saturating_sub(x_offset);
+                let visible_rows = u16::try_from(render_height).unwrap_or(0);
+                if local_scroll == 0 && render_height >= usize::from(rows) {
+                    let width = columns.min(area.width.saturating_sub(x_offset));
+                    let rect = Rect::new(area.x.saturating_add(x_offset), y, width, rows);
+                    sixel_debug_log(format_args!(
+                        "history-sixel-draw y={} rect={}x{} local_scroll={} render_height={} image={}x{}",
+                        y, rect.width, rect.height, local_scroll, render_height, columns, rows
+                    ));
+                    render_sixel_history_image_to_buffer(buf, rect, &data);
+                } else {
+                    let rect = Rect::new(
+                        area.x.saturating_add(x_offset),
+                        y,
+                        visible_width,
+                        visible_rows,
+                    );
+                    sixel_debug_log(format_args!(
+                        "history-sixel-clear y={} rect={}x{} local_scroll={} render_height={} image={}x{}",
+                        y, rect.width, rect.height, local_scroll, render_height, columns, rows
+                    ));
+                    render_sixel_history_image_to_buffer(
+                        buf,
+                        rect,
+                        &sixel_clear_area_sequence(rect, cell_size, clear_background, is_tmux),
+                    );
+                }
+            }
+        }
+
+        y = y.saturating_add(u16::try_from(render_height).unwrap_or(0));
+    }
+
+    if let Some((cell_size, clear_background, is_tmux)) = clear_context
+        && let Some(cell) = buf.cell_mut((area.x, area.y))
+    {
+        let symbol = cell.symbol().to_string();
+        let clear_area = sixel_clear_area_sequence(area, cell_size, clear_background, is_tmux);
+        sixel_debug_log(format_args!(
+            "history-prefix-clear area={}x{} original_symbol_bytes={} clear_bytes={}",
+            area.width,
+            area.height,
+            symbol.len(),
+            clear_area.len()
+        ));
+        cell.set_symbol(&format!("{clear_area}{symbol}"));
+    }
+}
+
+fn prepare_history_render_items(
+    lines: &[Line<'static>],
+    width: u16,
+) -> (Vec<HistoryRenderItem>, usize) {
+    let mut items = Vec::new();
+    let mut total_height = 0usize;
+    let mut source = lines.iter().peekable();
+
+    while let Some(line) = source.next() {
+        if let Some((image, prefix_width)) = sixel_history_image_with_prefix_width_from_line(line) {
+            let rows = image.rows.max(1);
+            total_height += usize::from(rows);
+            items.push(HistoryRenderItem::Sixel {
+                cell_size: image.cell_size,
+                clear_background: image.clear_background,
+                data: image.data,
+                columns: image.columns.max(1),
+                is_tmux: image.is_tmux,
+                rows,
+                prefix_width,
+            });
+            while source
+                .peek()
+                .is_some_and(|line| is_sixel_history_reserve_line(line))
+            {
+                source.next();
+            }
+            continue;
+        }
+
+        if is_sixel_history_reserve_line(line) {
+            continue;
+        }
+
+        let height = Paragraph::new(Text::from(vec![line.clone()]))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .max(1);
+        total_height += height;
+        items.push(HistoryRenderItem::Text {
+            line: line.clone(),
+            height,
+        });
+    }
+
+    (items, total_height)
+}
+
+impl HistoryRenderItem {
+    fn height(&self) -> usize {
+        match self {
+            Self::Text { height, .. } => *height,
+            Self::Sixel { rows, .. } => usize::from(*rows),
+        }
+    }
+}
+
+fn render_sixel_history_image_to_buffer(buf: &mut Buffer, area: Rect, data: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    if let Some(cell) = buf.cell_mut((area.x, area.y)) {
+        cell.set_symbol(data);
+    }
+
+    let mut skip_first = false;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if !skip_first {
+                skip_first = true;
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_skip(true);
+            }
+        }
     }
 }
 
@@ -2678,21 +2912,57 @@ pub(crate) fn new_image_generation_call(
     call_id: String,
     revised_prompt: Option<String>,
     saved_path: Option<AbsolutePathBuf>,
-) -> PlainHistoryCell {
-    let detail = revised_prompt.unwrap_or_else(|| call_id.clone());
-
-    let mut lines: Vec<Line<'static>> = vec![
-        vec!["• ".dim(), "Generated Image:".bold()].into(),
-        vec!["  └ ".dim(), detail.dim()].into(),
-    ];
-    if let Some(saved_path) = saved_path {
-        let saved_path = Url::from_file_path(saved_path.as_path())
-            .map(|url| url.to_string())
-            .unwrap_or_else(|_| saved_path.display().to_string());
-        lines.push(vec!["  └ ".dim(), "Saved to: ".dim(), saved_path.into()].into());
+) -> ImageGenerationHistoryCell {
+    ImageGenerationHistoryCell {
+        call_id,
+        revised_prompt,
+        saved_path,
     }
+}
 
-    PlainHistoryCell { lines }
+#[derive(Debug)]
+pub(crate) struct ImageGenerationHistoryCell {
+    call_id: String,
+    revised_prompt: Option<String>,
+    saved_path: Option<AbsolutePathBuf>,
+}
+
+impl HistoryCell for ImageGenerationHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let detail = self
+            .revised_prompt
+            .as_deref()
+            .unwrap_or(&self.call_id)
+            .to_string();
+        let mut lines: Vec<Line<'static>> = vec![
+            vec!["• ".dim(), "Generated Image:".bold()].into(),
+            vec!["  └ ".dim(), detail.dim()].into(),
+        ];
+
+        if let Some(saved_path) = &self.saved_path {
+            let saved_path_text = Url::from_file_path(saved_path.as_path())
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| saved_path.display().to_string());
+            lines.push(vec!["  └ ".dim(), "Saved to: ".dim(), saved_path_text.into()].into());
+
+            if width > 0 && width < u16::MAX {
+                let preview_width = width.saturating_sub(4).max(1);
+                let cache_key = local_image_preview_cache_key(Some(usize::from(preview_width)));
+                let preview_lines =
+                    render_local_image_preview_to_lines(saved_path.as_path(), cache_key);
+
+                if let Some(preview_lines) = preview_lines
+                    && !preview_lines.is_empty()
+                {
+                    lines.push(vec!["  └ ".dim(), "Preview:".dim()].into());
+                    lines.push("".into());
+                    lines.extend(prefix_lines(preview_lines, "    ".into(), "    ".into()));
+                }
+            }
+        }
+
+        lines
+    }
 }
 
 /// Create the reasoning history cell emitted at the end of a reasoning block.
@@ -3098,6 +3368,106 @@ mod tests {
                 expected_saved_path,
             ],
         );
+    }
+
+    #[test]
+    fn image_generation_call_renders_image_preview_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let image_path = temp_dir.path().join("generated-preview.png");
+        let image = image::RgbaImage::from_fn(40, 40, |x, y| {
+            if x < 20 && y < 20 {
+                image::Rgba([255, 0, 0, 255])
+            } else if x >= 20 && y < 20 {
+                image::Rgba([0, 255, 0, 255])
+            } else if x < 20 {
+                image::Rgba([0, 0, 255, 255])
+            } else {
+                image::Rgba([255, 255, 0, 255])
+            }
+        });
+        image.save(&image_path).expect("save preview image");
+
+        let saved_path = image_path.abs();
+        let saved_path_url = Url::from_file_path(saved_path.as_path())
+            .expect("test path should convert to file URL")
+            .to_string();
+        let cell = new_image_generation_call(
+            "call-image-generation".to_string(),
+            Some("A tiny checkerboard".to_string()),
+            Some(saved_path),
+        );
+
+        let rendered = render_image_preview_snapshot_lines(&cell.display_lines(/*width*/ 24))
+            .join("\n")
+            .replace(&saved_path_url, "file:///tmp/generated-preview.png");
+
+        insta::assert_snapshot!(rendered);
+
+        let lines = cell.display_lines(/*width*/ 24);
+        let (_, total_height) = prepare_history_render_items(&lines, /*width*/ 24);
+        assert_eq!(
+            cell.desired_height(/*width*/ 24),
+            u16::try_from(total_height).unwrap_or(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn image_generation_previews_keep_distinct_image_data() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let first_path = temp_dir.path().join("first.png");
+        let second_path = temp_dir.path().join("second.png");
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([255, 0, 0, 255]))
+            .save(&first_path)
+            .expect("first image should save");
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 0, 255, 255]))
+            .save(&second_path)
+            .expect("second image should save");
+
+        let first = new_image_generation_call(
+            "first-call".to_string(),
+            Some("first".to_string()),
+            Some(first_path.abs()),
+        );
+        let second = new_image_generation_call(
+            "second-call".to_string(),
+            Some("second".to_string()),
+            Some(second_path.abs()),
+        );
+
+        let first_image = first
+            .display_lines(/*width*/ 24)
+            .iter()
+            .find_map(sixel_history_image_from_line)
+            .expect("first preview should render");
+        let second_image = second
+            .display_lines(/*width*/ 24)
+            .iter()
+            .find_map(sixel_history_image_from_line)
+            .expect("second preview should render");
+
+        assert_ne!(first_image.data, second_image.data);
+    }
+
+    fn render_image_preview_snapshot_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                if let Some(image) = sixel_history_image_from_line(line) {
+                    return format!(
+                        "    <sixel image cols={} rows={}>",
+                        image.columns, image.rows
+                    );
+                }
+                if is_sixel_history_reserve_line(line) {
+                    return "    <sixel image reserve>".to_string();
+                }
+
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     fn session_configured_event(model: &str) -> SessionConfiguredEvent {

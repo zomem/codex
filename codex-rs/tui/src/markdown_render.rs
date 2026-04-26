@@ -5,12 +5,14 @@
 //! transcripts show the real file target (including normalized location suffixes) and can shorten
 //! absolute paths relative to a known working directory.
 
+use crate::image_preview::render_markdown_image_to_lines;
 use crate::render::highlight::highlight_code_to_lines;
 use crate::render::line_utils::line_to_static;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 use codex_utils_string::normalize_markdown_hash_location_suffix;
 use dirs::home_dir;
+use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::CowStr;
 use pulldown_cmark::Event;
@@ -19,6 +21,8 @@ use pulldown_cmark::Options;
 use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -27,6 +31,7 @@ use regex_lite::Regex;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use textwrap::WordSeparator;
 use url::Url;
 
 struct MarkdownStyles {
@@ -86,6 +91,38 @@ impl IndentContext {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    rows: Vec<Vec<Line<'static>>>,
+    header_row_count: usize,
+    current_row: Vec<Line<'static>>,
+    current_cell: Option<Line<'static>>,
+}
+
+impl TableState {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            ..Self::default()
+        }
+    }
+
+    fn finish_cell(&mut self) {
+        self.current_row
+            .push(self.current_cell.take().unwrap_or_default());
+    }
+
+    fn finish_row(&mut self) {
+        if self.current_cell.is_some() {
+            self.finish_cell();
+        }
+        if !self.current_row.is_empty() {
+            self.rows.push(std::mem::take(&mut self.current_row));
+        }
+    }
+}
+
 pub fn render_markdown_text(input: &str) -> Text<'static> {
     render_markdown_text_with_width(input, /*width*/ None)
 }
@@ -106,9 +143,11 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Text<'static> {
+    let normalized_input = normalize_table_boundaries(input);
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(input, options);
+    options.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(&normalized_input, options);
     let mut w = Writer::new(parser, width, cwd);
     w.run();
     w.text
@@ -123,6 +162,12 @@ struct LinkState {
     /// When this is present, the markdown label is intentionally suppressed so the rendered
     /// transcript always reflects the real target path.
     local_target_display: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ImageState {
+    destination: String,
+    alt_text: String,
 }
 
 fn should_render_link_destination(dest_url: &str) -> bool {
@@ -155,12 +200,14 @@ where
     indent_stack: Vec<IndentContext>,
     list_indices: Vec<Option<u64>>,
     link: Option<LinkState>,
+    image: Option<ImageState>,
     needs_newline: bool,
     pending_marker_line: bool,
     in_paragraph: bool,
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
+    table: Option<TableState>,
     wrap_width: Option<usize>,
     cwd: Option<PathBuf>,
     line_ends_with_local_link_target: bool,
@@ -170,6 +217,7 @@ where
     current_subsequent_indent: Vec<Span<'static>>,
     current_line_style: Style,
     current_line_in_code_block: bool,
+    current_line_preserve_layout: bool,
 }
 
 impl<'a, I> Writer<'a, I>
@@ -185,12 +233,14 @@ where
             indent_stack: Vec::new(),
             list_indices: Vec::new(),
             link: None,
+            image: None,
             needs_newline: false,
             pending_marker_line: false,
             in_paragraph: false,
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
+            table: None,
             wrap_width,
             cwd: cwd.map(Path::to_path_buf),
             line_ends_with_local_link_target: false,
@@ -200,6 +250,7 @@ where
             current_subsequent_indent: Vec::new(),
             current_line_style: Style::default(),
             current_line_in_code_block: false,
+            current_line_preserve_layout: false,
         }
     }
 
@@ -252,6 +303,10 @@ where
     }
 
     fn start_tag(&mut self, tag: Tag<'a>) {
+        if self.image.is_some() {
+            return;
+        }
+
         match tag {
             Tag::Paragraph => self.start_paragraph(),
             Tag::Heading { level, .. } => self.start_heading(level),
@@ -273,18 +328,23 @@ where
             Tag::Strong => self.push_inline_style(self.styles.strong),
             Tag::Strikethrough => self.push_inline_style(self.styles.strikethrough),
             Tag::Link { dest_url, .. } => self.push_link(dest_url.to_string()),
-            Tag::HtmlBlock
-            | Tag::FootnoteDefinition(_)
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
-            | Tag::Image { .. }
-            | Tag::MetadataBlock(_) => {}
+            Tag::Image { dest_url, .. } => self.start_image(dest_url.to_string()),
+            Tag::Table(alignments) => self.start_table(alignments),
+            Tag::TableHead => self.start_table_head(),
+            Tag::TableRow => self.start_table_row(),
+            Tag::TableCell => self.start_table_cell(),
+            Tag::HtmlBlock | Tag::FootnoteDefinition(_) | Tag::MetadataBlock(_) => {}
         }
     }
 
     fn end_tag(&mut self, tag: TagEnd) {
+        if self.image.is_some() {
+            if matches!(tag, TagEnd::Image) {
+                self.end_image();
+            }
+            return;
+        }
+
         match tag {
             TagEnd::Paragraph => self.end_paragraph(),
             TagEnd::Heading(_) => self.end_heading(),
@@ -297,12 +357,12 @@ where
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_inline_style(),
             TagEnd::Link => self.pop_link(),
+            TagEnd::Table => self.end_table(),
+            TagEnd::TableHead => self.end_table_head(),
+            TagEnd::TableRow => self.end_table_row(),
+            TagEnd::TableCell => self.end_table_cell(),
             TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::Image
             | TagEnd::MetadataBlock(_) => {}
         }
@@ -365,6 +425,10 @@ where
     }
 
     fn text(&mut self, text: CowStr<'a>) {
+        if let Some(image) = self.image.as_mut() {
+            image.alt_text.push_str(&text);
+            return;
+        }
         if self.suppressing_local_link_label() {
             return;
         }
@@ -380,6 +444,19 @@ where
         // original line breaks, so inserting separators would double them.
         if self.in_code_block && self.code_block_lang.is_some() {
             self.code_block_buffer.push_str(&text);
+            return;
+        }
+
+        if self.table.is_some() {
+            for (index, segment) in text.split('\n').enumerate() {
+                if index > 0 {
+                    self.push_table_soft_break();
+                }
+                if !segment.is_empty() {
+                    let style = self.inline_styles.last().copied().unwrap_or_default();
+                    self.push_span(Span::styled(segment.to_string(), style));
+                }
+            }
             return;
         }
 
@@ -418,10 +495,18 @@ where
     }
 
     fn code(&mut self, code: CowStr<'a>) {
+        if let Some(image) = self.image.as_mut() {
+            image.alt_text.push_str(&code);
+            return;
+        }
         if self.suppressing_local_link_label() {
             return;
         }
         self.line_ends_with_local_link_target = false;
+        if self.table.is_some() {
+            self.push_span(Span::from(code.into_string()).style(self.styles.code));
+            return;
+        }
         if self.pending_marker_line {
             self.push_line(Line::default());
             self.pending_marker_line = false;
@@ -431,10 +516,22 @@ where
     }
 
     fn html(&mut self, html: CowStr<'a>, inline: bool) {
+        if let Some(image) = self.image.as_mut() {
+            image.alt_text.push_str(&html);
+            return;
+        }
         if self.suppressing_local_link_label() {
             return;
         }
         self.line_ends_with_local_link_target = false;
+        if self.table.is_some() {
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            let normalized = html.replace("<br/>", " ").replace("<br>", " ");
+            if !normalized.is_empty() {
+                self.push_span(Span::styled(normalized, style));
+            }
+            return;
+        }
         self.pending_marker_line = false;
         for (i, line) in html.lines().enumerate() {
             if self.needs_newline {
@@ -451,15 +548,31 @@ where
     }
 
     fn hard_break(&mut self) {
+        if self.image.is_some() {
+            self.push_image_alt_space();
+            return;
+        }
         if self.suppressing_local_link_label() {
             return;
         }
         self.line_ends_with_local_link_target = false;
+        if self.table.is_some() {
+            self.push_table_soft_break();
+            return;
+        }
         self.push_line(Line::default());
     }
 
     fn soft_break(&mut self) {
+        if self.image.is_some() {
+            self.push_image_alt_space();
+            return;
+        }
         if self.suppressing_local_link_label() {
+            return;
+        }
+        if self.table.is_some() {
+            self.push_table_soft_break();
             return;
         }
         if self.line_ends_with_local_link_target {
@@ -481,6 +594,59 @@ where
     fn end_list(&mut self) {
         self.list_indices.pop();
         self.needs_newline = true;
+    }
+
+    fn start_table(&mut self, alignments: Vec<Alignment>) {
+        self.flush_current_line();
+        if self.pending_marker_line {
+            self.push_line(Line::default());
+        }
+        if self.needs_newline && !self.text.lines.is_empty() {
+            self.push_blank_line();
+        }
+        self.pending_marker_line = false;
+        self.needs_newline = false;
+        self.table = Some(TableState::new(alignments));
+    }
+
+    fn end_table(&mut self) {
+        let Some(mut table) = self.table.take() else {
+            return;
+        };
+        table.finish_row();
+        for line in render_table_lines(table, self.wrap_width) {
+            self.push_layout_sensitive_line(line);
+        }
+        self.needs_newline = true;
+    }
+
+    fn start_table_head(&mut self) {}
+
+    fn end_table_head(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.finish_row();
+            table.header_row_count = table.rows.len();
+        }
+    }
+
+    fn start_table_row(&mut self) {}
+
+    fn end_table_row(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.finish_row();
+        }
+    }
+
+    fn start_table_cell(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.current_cell = Some(Line::default());
+        }
+    }
+
+    fn end_table_cell(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.finish_cell();
+        }
     }
 
     fn start_item(&mut self) {
@@ -580,6 +746,79 @@ where
         self.inline_styles.pop();
     }
 
+    fn start_image(&mut self, destination: String) {
+        self.line_ends_with_local_link_target = false;
+        self.pending_local_link_soft_break = false;
+        self.image = Some(ImageState {
+            destination,
+            alt_text: String::new(),
+        });
+    }
+
+    fn end_image(&mut self) {
+        let Some(image) = self.image.take() else {
+            return;
+        };
+
+        if self.table.is_some() {
+            self.push_image_alt_fallback(image.alt_text);
+            return;
+        }
+
+        if let Some(rendered_lines) =
+            render_markdown_image_to_lines(&image.destination, self.cwd.as_deref(), self.wrap_width)
+        {
+            self.flush_before_block_image();
+            for line in rendered_lines {
+                self.push_layout_sensitive_line(line);
+            }
+            self.needs_newline = true;
+            return;
+        }
+
+        self.push_image_alt_fallback(image.alt_text);
+    }
+
+    fn push_image_alt_fallback(&mut self, alt_text: String) {
+        if alt_text.is_empty() {
+            return;
+        }
+        let style = self.inline_styles.last().copied().unwrap_or_default();
+        self.push_span(Span::styled(alt_text, style));
+    }
+
+    fn flush_before_block_image(&mut self) {
+        if self
+            .current_line_content
+            .as_ref()
+            .is_some_and(|line| line.spans.is_empty())
+            && self.current_initial_indent.is_empty()
+            && self.current_subsequent_indent.is_empty()
+            && !self.pending_marker_line
+        {
+            self.current_line_content = None;
+            self.current_line_style = Style::default();
+            self.current_line_in_code_block = false;
+            self.current_line_preserve_layout = false;
+            self.line_ends_with_local_link_target = false;
+            return;
+        }
+
+        self.flush_current_line();
+    }
+
+    fn push_image_alt_space(&mut self) {
+        if let Some(image) = self.image.as_mut()
+            && !image
+                .alt_text
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace)
+        {
+            image.alt_text.push(' ');
+        }
+    }
+
     fn push_link(&mut self, dest_url: String) {
         let show_destination = should_render_link_destination(&dest_url);
         self.link = Some(LinkState {
@@ -624,11 +863,29 @@ where
             .is_some()
     }
 
+    fn push_table_soft_break(&mut self) {
+        let style = self.inline_styles.last().copied().unwrap_or_default();
+        let should_insert = self
+            .table
+            .as_ref()
+            .and_then(|table| table.current_cell.as_ref())
+            .is_some_and(|line| {
+                line.spans
+                    .last()
+                    .and_then(|span| span.content.chars().last())
+                    .is_some_and(|ch| !ch.is_whitespace())
+            });
+        if should_insert {
+            self.push_span(Span::styled(" ".to_string(), style));
+        }
+    }
+
     fn flush_current_line(&mut self) {
         if let Some(line) = self.current_line_content.take() {
             let style = self.current_line_style;
             // NB we don't wrap code in code blocks, in order to preserve whitespace for copy/paste.
             if !self.current_line_in_code_block
+                && !self.current_line_preserve_layout
                 && let Some(width) = self.wrap_width
             {
                 let opts = RtOptions::new(width)
@@ -647,11 +904,20 @@ where
             self.current_initial_indent.clear();
             self.current_subsequent_indent.clear();
             self.current_line_in_code_block = false;
+            self.current_line_preserve_layout = false;
             self.line_ends_with_local_link_target = false;
         }
     }
 
     fn push_line(&mut self, line: Line<'static>) {
+        self.push_line_with_layout(line, /*preserve_layout*/ false);
+    }
+
+    fn push_layout_sensitive_line(&mut self, line: Line<'static>) {
+        self.push_line_with_layout(line, /*preserve_layout*/ true);
+    }
+
+    fn push_line_with_layout(&mut self, line: Line<'static>, preserve_layout: bool) {
         self.flush_current_line();
         let blockquote_active = self
             .indent_stack
@@ -669,12 +935,21 @@ where
         self.current_line_style = style;
         self.current_line_content = Some(line);
         self.current_line_in_code_block = self.in_code_block;
+        self.current_line_preserve_layout = preserve_layout;
         self.line_ends_with_local_link_target = false;
 
         self.pending_marker_line = false;
     }
 
     fn push_span(&mut self, span: Span<'static>) {
+        if let Some(table) = self.table.as_mut() {
+            if let Some(cell) = table.current_cell.as_mut() {
+                cell.push_span(span);
+            } else {
+                table.current_cell = Some(Line::from(vec![span]));
+            }
+            return;
+        }
         if let Some(line) = self.current_line_content.as_mut() {
             line.push_span(span);
         } else {
@@ -724,6 +999,302 @@ where
 
         prefix
     }
+}
+
+fn normalize_table_boundaries(input: &str) -> String {
+    let lines = input.split_inclusive('\n').collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0usize;
+    let mut active_fence: Option<(char, usize)> = None;
+
+    while index < lines.len() {
+        let (line_without_newline, _) = strip_trailing_newline(lines[index]);
+
+        if let Some((marker, marker_len)) = active_fence {
+            output.push_str(lines[index]);
+            if let Some((candidate_marker, candidate_len)) =
+                parse_fence_marker(line_without_newline)
+                && candidate_marker == marker
+                && candidate_len >= marker_len
+            {
+                active_fence = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some((marker, marker_len)) = parse_fence_marker(line_without_newline) {
+            output.push_str(lines[index]);
+            active_fence = Some((marker, marker_len));
+            index += 1;
+            continue;
+        }
+
+        if starts_table_at(&lines, index) {
+            output.push_str(lines[index]);
+            output.push_str(lines[index + 1]);
+            index += 2;
+
+            while index < lines.len() {
+                if starts_table_at(&lines, index) {
+                    break;
+                }
+
+                if !is_table_row_candidate(strip_trailing_newline(lines[index]).0) {
+                    break;
+                }
+
+                output.push_str(lines[index]);
+                index += 1;
+            }
+
+            if index < lines.len() && !strip_trailing_newline(lines[index]).0.trim().is_empty() {
+                output.push('\n');
+            }
+            continue;
+        }
+
+        output.push_str(lines[index]);
+        index += 1;
+    }
+
+    output
+}
+
+fn starts_table_at(lines: &[&str], index: usize) -> bool {
+    index + 1 < lines.len()
+        && is_table_row_candidate(strip_trailing_newline(lines[index]).0)
+        && is_table_delimiter_line(strip_trailing_newline(lines[index + 1]).0)
+}
+
+fn strip_trailing_newline(line: &str) -> (&str, bool) {
+    if let Some(stripped) = line.strip_suffix('\n') {
+        (stripped, true)
+    } else {
+        (line, false)
+    }
+}
+
+fn parse_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len().saturating_sub(trimmed.len());
+    if indent > 3 || trimmed.is_empty() {
+        return None;
+    }
+
+    let marker = match trimmed.as_bytes().first().copied() {
+        Some(b'`') => '`',
+        Some(b'~') => '~',
+        _ => return None,
+    };
+    let run_len = trimmed.chars().take_while(|ch| *ch == marker).count();
+    if run_len < 3 {
+        return None;
+    }
+
+    Some((marker, run_len))
+}
+
+fn is_table_row_candidate(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.contains('|')
+}
+
+fn is_table_delimiter_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.contains('|') {
+        return false;
+    }
+
+    let mut saw_valid_segment = false;
+    for segment in trimmed.trim_matches('|').split('|') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        if segment.len() < 3 || !segment.chars().all(|ch| ch == '-' || ch == ':') {
+            return false;
+        }
+        saw_valid_segment = true;
+    }
+
+    saw_valid_segment
+}
+
+fn render_table_lines(table: TableState, max_width: Option<usize>) -> Vec<Line<'static>> {
+    let column_count = table
+        .rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(table.alignments.len());
+    if column_count == 0 {
+        return Vec::new();
+    }
+
+    let mut widths = vec![1usize; column_count];
+    for row in &table.rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.width().max(1));
+        }
+    }
+
+    if let Some(width) = max_width {
+        let min_total_width = column_count * 4 + 1;
+        if width >= min_total_width && table_total_width(&widths) > width {
+            let available_content_width = width.saturating_sub(column_count * 3 + 1);
+            if let Some(shrunk) =
+                shrink_table_content_widths(widths.clone(), available_content_width)
+            {
+                widths = shrunk;
+            }
+        }
+    }
+
+    let border_style = Style::default().add_modifier(Modifier::DIM);
+    let header_style = Style::default().fg(Color::Yellow);
+    let mut lines = vec![make_table_border_line('┌', '┬', '┐', &widths, border_style)];
+    let row_count = table.rows.len();
+    let header_row_count = table.header_row_count;
+
+    for (index, row) in table.rows.into_iter().enumerate() {
+        lines.extend(render_table_row(
+            row,
+            &widths,
+            &table.alignments,
+            border_style,
+            (index < header_row_count).then_some(header_style),
+        ));
+        if index + 1 < row_count {
+            lines.push(make_table_border_line('├', '┼', '┤', &widths, border_style));
+        }
+    }
+
+    lines.push(make_table_border_line('└', '┴', '┘', &widths, border_style));
+    lines
+}
+
+fn table_total_width(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + widths.len() * 3 + 1
+}
+
+fn shrink_table_content_widths(
+    mut widths: Vec<usize>,
+    available_total: usize,
+) -> Option<Vec<usize>> {
+    let minimum_total = widths.len();
+    if available_total < minimum_total {
+        return None;
+    }
+
+    let mut current_total = widths.iter().sum::<usize>();
+    while current_total > available_total {
+        let widest = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > 1)
+            .max_by_key(|(_, width)| **width)
+            .map(|(index, _)| index)?;
+        widths[widest] -= 1;
+        current_total -= 1;
+    }
+
+    Some(widths)
+}
+
+fn render_table_row(
+    row: Vec<Line<'static>>,
+    column_widths: &[usize],
+    alignments: &[Alignment],
+    border_style: Style,
+    cell_style: Option<Style>,
+) -> Vec<Line<'static>> {
+    let wrapped_cells = column_widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| wrap_table_cell(row.get(index).cloned().unwrap_or_default(), *width))
+        .collect::<Vec<_>>();
+    let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
+
+    let mut rendered_rows = Vec::with_capacity(row_height);
+    for row_index in 0..row_height {
+        let mut spans = vec![Span::styled("│", border_style)];
+        for (column_index, content_width) in column_widths.iter().copied().enumerate() {
+            spans.push(" ".into());
+            let cell_line = wrapped_cells[column_index]
+                .get(row_index)
+                .cloned()
+                .unwrap_or_default();
+            let spare_width = content_width.saturating_sub(cell_line.width());
+            let (left_padding, right_padding) = match alignments
+                .get(column_index)
+                .copied()
+                .unwrap_or(Alignment::None)
+            {
+                Alignment::Center => (spare_width / 2, spare_width - spare_width / 2),
+                Alignment::Right => (spare_width, 0),
+                Alignment::None | Alignment::Left => (0, spare_width),
+            };
+            if left_padding > 0 {
+                spans.push(Span::raw(" ".repeat(left_padding)));
+            }
+            if let Some(style) = cell_style {
+                spans.extend(
+                    cell_line
+                        .spans
+                        .into_iter()
+                        .map(|span| span.patch_style(style)),
+                );
+            } else {
+                spans.extend(cell_line.spans);
+            }
+            if right_padding > 0 {
+                spans.push(Span::raw(" ".repeat(right_padding)));
+            }
+            spans.push(" ".into());
+            spans.push(Span::styled("│", border_style));
+        }
+        rendered_rows.push(Line::from(spans));
+    }
+
+    rendered_rows
+}
+
+fn wrap_table_cell(cell: Line<'static>, content_width: usize) -> Vec<Line<'static>> {
+    if cell.spans.is_empty() {
+        return vec![Line::default()];
+    }
+
+    let wrapped = crate::wrapping::word_wrap_lines(
+        std::iter::once(cell),
+        RtOptions::new(content_width).word_separator(WordSeparator::UnicodeBreakProperties),
+    );
+    if wrapped.is_empty() {
+        vec![Line::default()]
+    } else {
+        wrapped
+    }
+}
+
+fn make_table_border_line(
+    start: char,
+    joint: char,
+    end: char,
+    column_widths: &[usize],
+    style: Style,
+) -> Line<'static> {
+    let mut text = String::new();
+    text.push(start);
+    for (index, width) in column_widths.iter().enumerate() {
+        text.push_str(&"─".repeat(width + 2));
+        if index + 1 == column_widths.len() {
+            text.push(end);
+        } else {
+            text.push(joint);
+        }
+    }
+    Line::from(vec![Span::styled(text, style)])
 }
 
 fn is_local_path_like_link(dest_url: &str) -> bool {
