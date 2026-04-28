@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -69,8 +70,29 @@ pub(crate) struct TurnMetadataBag {
 
 impl TurnMetadataBag {
     fn to_header_value(&self) -> Option<String> {
-        serde_json::to_string(self).ok()
+        to_ascii_json(self)
     }
+}
+
+fn to_ascii_json<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    let json = serde_json::to_string(value).ok()?;
+    if json.is_ascii() {
+        return Some(json);
+    }
+
+    // HTTP header values need an ASCII-safe representation on all transports.
+    let mut escaped = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if ch.is_ascii() {
+            escaped.push(ch);
+        } else {
+            let mut code_units = [0; 2];
+            for code_unit in ch.encode_utf16(&mut code_units) {
+                write!(escaped, "\\u{code_unit:04x}").ok()?;
+            }
+        }
+    }
+    Some(escaped)
 }
 
 fn merge_responsesapi_client_metadata(
@@ -84,7 +106,7 @@ fn merge_responsesapi_client_metadata(
             .entry(key.clone())
             .or_insert_with(|| Value::String(value.clone()));
     }
-    serde_json::to_string(&metadata).ok()
+    to_ascii_json(&metadata)
 }
 
 fn build_turn_metadata_bag(

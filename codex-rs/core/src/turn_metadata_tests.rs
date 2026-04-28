@@ -7,6 +7,8 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
+use http::HeaderValue;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -150,4 +152,60 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     assert_eq!(json["session_id"].as_str(), Some("session-a"));
     assert_eq!(json["thread_source"].as_str(), Some("user"));
     assert_eq!(json["turn_id"].as_str(), Some("turn-a"));
+}
+
+#[test]
+fn turn_metadata_header_escapes_non_ascii_workspace_paths() {
+    let repo_root = "/tmp/智能外呼".to_string();
+    let header = build_turn_metadata_bag(
+        Some("session-a".to_string()),
+        Some("user"),
+        Some("turn-a".to_string()),
+        Some("none".to_string()),
+        Some(repo_root.clone()),
+        Some(WorkspaceGitMetadata {
+            associated_remote_urls: None,
+            latest_git_commit_hash: Some("abc123".to_string()),
+            has_changes: Some(true),
+        }),
+    )
+    .to_header_value()
+    .expect("header");
+
+    assert!(header.is_ascii());
+    let header_value = HeaderValue::from_str(&header).expect("header value");
+    assert_eq!(header_value.to_str().expect("header str"), header);
+
+    let json: Value = serde_json::from_str(&header).expect("json");
+    let workspace = json
+        .get("workspaces")
+        .and_then(Value::as_object)
+        .and_then(|workspaces| workspaces.get(&repo_root))
+        .expect("workspace");
+    assert_eq!(
+        workspace
+            .get("latest_git_commit_hash")
+            .and_then(Value::as_str),
+        Some("abc123")
+    );
+}
+
+#[test]
+fn turn_metadata_merge_escapes_non_ascii_client_metadata() {
+    let header = r#"{"session_id":"session-a"}"#;
+    let merged = merge_responsesapi_client_metadata(
+        header,
+        Some(&HashMap::from([(
+            "workspace_label".to_string(),
+            "智能外呼".to_string(),
+        )])),
+    )
+    .expect("merged metadata");
+
+    assert!(merged.is_ascii());
+    let header_value = HeaderValue::from_str(&merged).expect("header value");
+    assert_eq!(header_value.to_str().expect("header str"), merged);
+
+    let json: Value = serde_json::from_str(&merged).expect("json");
+    assert_eq!(json["workspace_label"].as_str(), Some("智能外呼"));
 }
