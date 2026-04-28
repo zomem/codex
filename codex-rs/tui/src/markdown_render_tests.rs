@@ -18,7 +18,7 @@ fn render_markdown_text_for_cwd(input: &str, cwd: &Path) -> Text<'static> {
     render_markdown_text_with_width_and_cwd(input, /*width*/ None, Some(cwd))
 }
 
-fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
+fn plain_lines(text: &Text<'_>) -> Vec<String> {
     text.lines
         .iter()
         .map(|line| {
@@ -854,7 +854,7 @@ fn markdown_render_file_link_snapshot() {
 fn table_renders_grid() {
     let text = render_markdown_text("| Left | Right |\n|------|------:|\n| a | b |\n");
     assert_eq!(
-        lines_to_strings(&text),
+        plain_lines(&text),
         vec![
             "┌──────┬───────┐".to_string(),
             "│ Left │ Right │".to_string(),
@@ -899,7 +899,7 @@ fn table_wraps_long_cells_to_fit_width() {
     assert!(
         text.lines.iter().all(|line| line.width() <= 24),
         "expected wrapped table to fit width: {:?}",
-        lines_to_strings(&text)
+        plain_lines(&text)
     );
 }
 
@@ -909,7 +909,7 @@ fn table_renders_multiple_body_rows_without_column_merging() {
         "| 步骤 | 负责人 | 状态 | 说明 |\n| --- | --- | --- | --- |\n| 需求确认 | 产品 | 已完成 | 明确目标和范围 |\n| 页面设计 | 设计 | 进行中 | 输出界面草图 |\n| 功能开发 | 开发 | 未开始 | 编写核心逻辑 |\n| 测试验收 | 测试 | 未开始 | 验证功能是否符合预期 |\n",
     );
     assert_eq!(
-        lines_to_strings(&text),
+        plain_lines(&text),
         vec![
             "┌──────────┬────────┬────────┬──────────────────────┐".to_string(),
             "│ 步骤     │ 负责人 │ 状态   │ 说明                 │".to_string(),
@@ -932,7 +932,7 @@ fn consecutive_tables_render_as_distinct_blocks() {
         "| A | B |\n| --- | --- |\n| 1 | 2 |\n| C | D |\n| --- | --- |\n| 3 | 4 |\n",
     );
     assert_eq!(
-        lines_to_strings(&text),
+        plain_lines(&text),
         vec![
             "┌───┬───┐".to_string(),
             "│ A │ B │".to_string(),
@@ -977,7 +977,7 @@ fn markdown_render_local_image_uses_sixel_preview() {
     assert_eq!(image.columns, 20);
     assert_eq!(image.rows, 10);
     assert!(!image.redraw_on_scroll);
-    assert!(!lines_to_strings(&text).join("\n").contains("alt text"));
+    assert!(!plain_lines(&text).join("\n").contains("alt text"));
 }
 
 #[test]
@@ -998,7 +998,7 @@ fn markdown_render_file_url_image_uses_sixel_preview() {
 
     assert_eq!(image.columns, 20);
     assert_eq!(image.rows, 10);
-    assert!(!lines_to_strings(&text).join("\n").contains("file alt"));
+    assert!(!plain_lines(&text).join("\n").contains("file alt"));
 }
 
 #[test]
@@ -1018,7 +1018,7 @@ fn markdown_render_files_url_image_uses_sixel_preview() {
 
     assert_eq!(image.columns, 20);
     assert_eq!(image.rows, 10);
-    assert!(!lines_to_strings(&text).join("\n").contains("files alt"));
+    assert!(!plain_lines(&text).join("\n").contains("files alt"));
 }
 
 #[test]
@@ -1078,7 +1078,7 @@ fn markdown_render_http_image_uses_sixel_preview() {
 
     assert_eq!(image.columns, 20);
     assert_eq!(image.rows, 10);
-    assert!(!lines_to_strings(&text).join("\n").contains("remote alt"));
+    assert!(!plain_lines(&text).join("\n").contains("remote alt"));
 }
 
 #[test]
@@ -1100,7 +1100,7 @@ fn markdown_render_data_image_uses_sixel_preview() {
 
     assert_eq!(image.columns, 20);
     assert_eq!(image.rows, 10);
-    assert!(!lines_to_strings(&text).join("\n").contains("蓝天白云"));
+    assert!(!plain_lines(&text).join("\n").contains("蓝天白云"));
 }
 
 #[test]
@@ -1394,6 +1394,46 @@ fn code_block_inside_unordered_list_item_multiple_lines() {
         })
         .collect();
     assert_eq!(lines, vec!["- Item", "", "  first", "  second"]);
+}
+
+#[test]
+fn list_item_after_code_block_keeps_blank_separator() {
+    let md = "1. First:\n\n   ```rust\n   fn first() {}\n   ```\n\n2. Second:\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec!["1. First:", "", "   fn first() {}", "", "2. Second:"]
+    );
+    assert_snapshot!(
+        "list_item_after_code_block_keeps_blank_separator",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn outer_list_item_after_nested_code_block_keeps_blank_separator() {
+    let md = "1. First:\n   - Nested:\n\n     ```rust\n     fn first() {}\n     ```\n\n2. Second:\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "1. First:",
+            "    - Nested:",
+            "",
+            "      fn first() {}",
+            "",
+            "2. Second:",
+        ]
+    );
+}
+
+#[test]
+fn list_item_after_simple_item_stays_compact() {
+    let md = "1. First\n\n2. Second\n";
+    let text = render_markdown_text(md);
+    assert_eq!(plain_lines(&text), vec!["1. First", "2. Second"]);
 }
 
 #[test]
