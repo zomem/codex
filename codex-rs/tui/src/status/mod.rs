@@ -11,6 +11,7 @@ mod card;
 mod format;
 mod helpers;
 mod rate_limits;
+mod weekly_limit;
 
 pub(crate) use account::StatusAccountDisplay;
 pub(crate) use card::StatusHistoryHandle;
@@ -28,6 +29,7 @@ pub(crate) use rate_limits::RateLimitWindowDisplay;
 #[cfg(test)]
 pub(crate) use rate_limits::rate_limit_snapshot_display;
 pub(crate) use rate_limits::rate_limit_snapshot_display_for_limit;
+pub(crate) use weekly_limit::weekly_limit_status_line;
 
 #[cfg(test)]
 mod tests;

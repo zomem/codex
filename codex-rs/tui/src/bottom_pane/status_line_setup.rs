@@ -529,7 +529,7 @@ mod tests {
                 ),
                 (
                     StatusLineItem::WeeklyLimit.preview_item(),
-                    "weekly 82%".to_string(),
+                    "[▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▂   ]".to_string(),
                 ),
             ]),
             AppEventSender::new(tx_raw),

@@ -1313,6 +1313,32 @@ async fn status_line_context_remaining_renders_labeled_percent() {
 }
 
 #[tokio::test]
+async fn status_line_weekly_limit_renders_remaining_bar() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.config.tui_status_line = Some(vec!["weekly-limit".to_string()]);
+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
+        primary: None,
+        secondary: Some(RateLimitWindow {
+            used_percent: 35.0,
+            window_minutes: Some(10_080),
+            resets_at: Some(1_770_000_000),
+        }),
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    }));
+    chat.refresh_status_line();
+
+    assert_eq!(
+        status_line_text(&chat),
+        Some("[▆▆▆▆▆▆▆▆▆▆▆▆▆       ]".to_string())
+    );
+}
+
+#[tokio::test]
 async fn status_line_legacy_context_usage_renders_context_used_percent() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

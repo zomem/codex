@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::status::format_tokens_compact;
+use crate::status::weekly_limit_status_line;
 
 /// Items shown in the terminal title when the user has not configured a
 /// custom selection. Intentionally minimal: activity indicator + project name.
@@ -150,17 +151,20 @@ impl ChatWidget {
             return;
         }
 
-        let mut parts = Vec::new();
+        let mut spans = Vec::new();
         for item in &selections.status_line_items {
-            if let Some(value) = self.status_line_value_for_item(item) {
-                parts.push(value);
+            if let Some(value) = self.status_line_line_for_item(item) {
+                if !spans.is_empty() {
+                    spans.push(" · ".into());
+                }
+                spans.extend(value.spans);
             }
         }
 
-        let line = if parts.is_empty() {
+        let line = if spans.is_empty() {
             None
         } else {
-            Some(Line::from(parts.join(" · ")))
+            Some(Line::from(spans))
         };
         self.set_status_line(line);
     }
@@ -497,6 +501,28 @@ impl ChatWidget {
     /// this to keep partially available status lines readable while waiting for session, token, or
     /// git metadata.
     pub(super) fn status_line_value_for_item(&mut self, item: &StatusLineItem) -> Option<String> {
+        self.status_line_line_for_item(item).map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect()
+        })
+    }
+
+    fn status_line_line_for_item(&mut self, item: &StatusLineItem) -> Option<Line<'static>> {
+        match item {
+            StatusLineItem::WeeklyLimit => {
+                let window = self
+                    .rate_limit_snapshots_by_limit_id
+                    .get("codex")
+                    .and_then(|s| s.secondary.as_ref())?;
+                Some(weekly_limit_status_line(window, Local::now()))
+            }
+            _ => self.status_line_text_for_item(item).map(Line::from),
+        }
+    }
+
+    fn status_line_text_for_item(&mut self, item: &StatusLineItem) -> Option<String> {
         match item {
             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name()),
@@ -535,17 +561,7 @@ impl ChatWidget {
                     .unwrap_or_else(|| "5h".to_string());
                 self.status_line_limit_display(window, &label)
             }
-            StatusLineItem::WeeklyLimit => {
-                let window = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
-                    .and_then(|s| s.secondary.as_ref());
-                let label = window
-                    .and_then(|window| window.window_minutes)
-                    .map(get_limits_duration)
-                    .unwrap_or_else(|| "weekly".to_string());
-                self.status_line_limit_display(window, &label)
-            }
+            StatusLineItem::WeeklyLimit => None,
             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
             StatusLineItem::ContextWindowSize => self
                 .status_line_context_window_size()
