@@ -19,7 +19,7 @@ pub(super) struct ThreadEventSnapshot {
 pub(super) enum ThreadBufferedEvent {
     Notification(ServerNotification),
     Request(ServerRequest),
-    HistoryEntryResponse(GetHistoryEntryResponseEvent),
+    HistoryEntryResponse(HistoryLookupResponse),
     FeedbackSubmission(FeedbackThreadEvent),
 }
 
@@ -318,6 +318,7 @@ mod tests {
     use super::*;
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
+    use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
     use codex_app_server_protocol::HookCompletedNotification;
     use codex_app_server_protocol::HookEventName as AppServerHookEventName;
@@ -334,8 +335,6 @@ mod tests {
     use codex_app_server_protocol::TurnStartedNotification;
     use codex_config::types::ApprovalsReviewer;
     use codex_protocol::models::PermissionProfile;
-    use codex_protocol::protocol::AskForApproval;
-    use codex_protocol::protocol::SandboxPolicy;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -350,8 +349,8 @@ mod tests {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
-            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: PermissionProfile::read_only(),
+            active_permission_profile: None,
             cwd: cwd.abs(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,

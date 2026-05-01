@@ -106,6 +106,7 @@ impl ThreadMetadataState {
             | SessionSource::Exec
             | SessionSource::Mcp
             | SessionSource::Custom(_)
+            | SessionSource::Internal(_)
             | SessionSource::Unknown => (None, None),
         };
         Self {
@@ -171,18 +172,21 @@ impl AnalyticsReducer {
                     rpc_transport,
                 );
             }
-            AnalyticsFact::Request {
+            AnalyticsFact::ClientRequest {
                 connection_id,
                 request_id,
                 request,
             } => {
                 self.ingest_request(connection_id, request_id, *request);
             }
-            AnalyticsFact::Response {
+            AnalyticsFact::ClientResponse {
                 connection_id,
+                request_id,
                 response,
             } => {
-                self.ingest_response(connection_id, *response, out);
+                if let Some(response) = response.into_client_response(request_id) {
+                    self.ingest_response(connection_id, response, out);
+                }
             }
             AnalyticsFact::ErrorResponse {
                 connection_id,
@@ -195,6 +199,13 @@ impl AnalyticsReducer {
             AnalyticsFact::Notification(notification) => {
                 self.ingest_notification(*notification, out);
             }
+            AnalyticsFact::ServerRequest {
+                connection_id: _connection_id,
+                request: _request,
+            } => {}
+            AnalyticsFact::ServerResponse {
+                response: _response,
+            } => {}
             AnalyticsFact::Custom(input) => match input {
                 CustomAnalyticsFact::SubAgentThreadStarted(input) => {
                     self.ingest_subagent_thread_started(input, out);

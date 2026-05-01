@@ -157,6 +157,13 @@ fn browser_controls_are_stable_and_enabled_by_default() {
     assert_eq!(Feature::BrowserUse.default_enabled(), true);
     assert_eq!(feature_for_key("browser_use"), Some(Feature::BrowserUse));
 
+    assert_eq!(Feature::BrowserUseExternal.stage(), Stage::Stable);
+    assert_eq!(Feature::BrowserUseExternal.default_enabled(), true);
+    assert_eq!(
+        feature_for_key("browser_use_external"),
+        Some(Feature::BrowserUseExternal)
+    );
+
     assert_eq!(Feature::ComputerUse.stage(), Stage::Stable);
     assert_eq!(Feature::ComputerUse.default_enabled(), true);
     assert_eq!(feature_for_key("computer_use"), Some(Feature::ComputerUse));
@@ -413,8 +420,11 @@ fn multi_agent_v2_feature_config_deserializes_table() {
 [multi_agent_v2]
 enabled = true
 max_concurrent_threads_per_session = 4
+min_wait_timeout_ms = 2500
 usage_hint_enabled = false
 usage_hint_text = "Custom delegation guidance."
+root_agent_usage_hint_text = "Root guidance."
+subagent_usage_hint_text = "Subagent guidance."
 hide_spawn_agent_metadata = true
 "#,
     )
@@ -429,8 +439,11 @@ hide_spawn_agent_metadata = true
         Some(crate::FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(true),
             max_concurrent_threads_per_session: Some(4),
+            min_wait_timeout_ms: Some(2500),
             usage_hint_enabled: Some(false),
             usage_hint_text: Some("Custom delegation guidance.".to_string()),
+            root_agent_usage_hint_text: Some("Root guidance.".to_string()),
+            subagent_usage_hint_text: Some("Subagent guidance.".to_string()),
             hide_spawn_agent_metadata: Some(true),
         }))
     );
@@ -461,8 +474,11 @@ usage_hint_enabled = false
         Some(crate::FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: None,
             max_concurrent_threads_per_session: None,
+            min_wait_timeout_ms: None,
             usage_hint_enabled: Some(false),
             usage_hint_text: None,
+            root_agent_usage_hint_text: None,
+            subagent_usage_hint_text: None,
             hide_spawn_agent_metadata: None,
         }))
     );

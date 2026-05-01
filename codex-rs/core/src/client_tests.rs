@@ -18,6 +18,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_rollout_trace::ExecutionStatus;
@@ -198,6 +199,18 @@ fn build_subagent_headers_sets_other_subagent_label() {
 }
 
 #[test]
+fn build_subagent_headers_sets_internal_memory_consolidation_label() {
+    let client = test_model_client(SessionSource::Internal(
+        InternalSessionSource::MemoryConsolidation,
+    ));
+    let headers = client.build_subagent_headers();
+    let value = headers
+        .get(X_OPENAI_SUBAGENT_HEADER)
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(value, Some("memory_consolidation"));
+}
+
+#[test]
 fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
     let parent_thread_id = ThreadId::new();
     let client = test_model_client(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -269,7 +282,12 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
     let item = output_message("msg-1", "partial answer");
     let api_stream = futures::stream::iter([Ok(ResponseEvent::OutputItemDone(item))])
         .chain(futures::stream::pending());
-    let (mut stream, _) = super::map_response_stream(api_stream, test_session_telemetry(), attempt);
+    let (mut stream, _) = super::map_response_events(
+        /*upstream_request_id*/ None,
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+    );
 
     let observed = stream
         .next()
@@ -319,7 +337,12 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         notify: Arc::clone(&backpressured_item_yielded),
     };
 
-    let (stream, _) = super::map_response_stream(api_stream, test_session_telemetry(), attempt);
+    let (stream, _) = super::map_response_events(
+        /*upstream_request_id*/ None,
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+    );
 
     // Fill the mapper channel with non-terminal events, then yield one output
     // item. The mapper has observed that item and is blocked trying to send it

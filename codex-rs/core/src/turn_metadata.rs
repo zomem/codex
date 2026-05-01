@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+use codex_utils_string::to_ascii_json_string;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -18,6 +18,8 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
+
+const TURN_STARTED_AT_UNIX_MS_KEY: &str = "turn_started_at_unix_ms";
 
 #[derive(Clone, Debug, Default)]
 struct WorkspaceGitMetadata {
@@ -70,43 +72,37 @@ pub(crate) struct TurnMetadataBag {
 
 impl TurnMetadataBag {
     fn to_header_value(&self) -> Option<String> {
-        to_ascii_json(self)
+        to_ascii_json_string(self).ok()
     }
 }
 
-fn to_ascii_json<T: Serialize + ?Sized>(value: &T) -> Option<String> {
-    let json = serde_json::to_string(value).ok()?;
-    if json.is_ascii() {
-        return Some(json);
-    }
-
-    // HTTP header values need an ASCII-safe representation on all transports.
-    let mut escaped = String::with_capacity(json.len());
-    for ch in json.chars() {
-        if ch.is_ascii() {
-            escaped.push(ch);
-        } else {
-            let mut code_units = [0; 2];
-            for code_unit in ch.encode_utf16(&mut code_units) {
-                write!(escaped, "\\u{code_unit:04x}").ok()?;
-            }
-        }
-    }
-    Some(escaped)
-}
-
-fn merge_responsesapi_client_metadata(
+fn merge_turn_metadata(
     header: &str,
+    turn_started_at_unix_ms: Option<i64>,
     responsesapi_client_metadata: Option<&HashMap<String, String>>,
 ) -> Option<String> {
-    let responsesapi_client_metadata = responsesapi_client_metadata?;
-    let mut metadata = serde_json::from_str::<serde_json::Map<String, Value>>(header).ok()?;
-    for (key, value) in responsesapi_client_metadata {
-        metadata
-            .entry(key.clone())
-            .or_insert_with(|| Value::String(value.clone()));
+    if turn_started_at_unix_ms.is_none() && responsesapi_client_metadata.is_none() {
+        return None;
     }
-    to_ascii_json(&metadata)
+
+    let mut metadata = serde_json::from_str::<serde_json::Map<String, Value>>(header).ok()?;
+    if let Some(turn_started_at_unix_ms) = turn_started_at_unix_ms {
+        metadata.insert(
+            TURN_STARTED_AT_UNIX_MS_KEY.to_string(),
+            Value::Number(turn_started_at_unix_ms.into()),
+        );
+    }
+    if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+        for (key, value) in responsesapi_client_metadata {
+            if key == TURN_STARTED_AT_UNIX_MS_KEY {
+                continue;
+            }
+            metadata
+                .entry(key.clone())
+                .or_insert_with(|| Value::String(value.clone()));
+        }
+    }
+    to_ascii_json_string(&metadata).ok()
 }
 
 fn build_turn_metadata_bag(
@@ -175,6 +171,7 @@ pub(crate) struct TurnMetadataState {
     base_metadata: TurnMetadataBag,
     base_header: String,
     enriched_header: Arc<RwLock<Option<String>>>,
+    turn_started_at_unix_ms: Arc<RwLock<Option<i64>>>,
     responsesapi_client_metadata: Arc<RwLock<Option<HashMap<String, String>>>>,
     enrichment_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -216,6 +213,7 @@ impl TurnMetadataState {
             base_metadata,
             base_header,
             enriched_header: Arc::new(RwLock::new(None)),
+            turn_started_at_unix_ms: Arc::new(RwLock::new(None)),
             responsesapi_client_metadata: Arc::new(RwLock::new(None)),
             enrichment_task: Arc::new(Mutex::new(None)),
         }
@@ -233,13 +231,21 @@ impl TurnMetadataState {
         } else {
             self.base_header.clone()
         };
+        let turn_started_at_unix_ms = *self
+            .turn_started_at_unix_ms
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let responsesapi_client_metadata = self
             .responsesapi_client_metadata
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        merge_responsesapi_client_metadata(&header, responsesapi_client_metadata.as_ref())
-            .or(Some(header))
+        merge_turn_metadata(
+            &header,
+            turn_started_at_unix_ms,
+            responsesapi_client_metadata.as_ref(),
+        )
+        .or(Some(header))
     }
 
     pub(crate) fn current_meta_value(&self) -> Option<serde_json::Value> {
@@ -256,6 +262,13 @@ impl TurnMetadataState {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(responsesapi_client_metadata);
+    }
+
+    pub(crate) fn set_turn_started_at_unix_ms(&self, turn_started_at_unix_ms: i64) {
+        *self
+            .turn_started_at_unix_ms
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn_started_at_unix_ms);
     }
 
     pub(crate) fn spawn_git_enrichment_task(&self) {
