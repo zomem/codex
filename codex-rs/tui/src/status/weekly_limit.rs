@@ -7,25 +7,25 @@ use ratatui::text::Span;
 
 use super::rate_limits::RateLimitWindowDisplay;
 
-const WEEKLY_LIMIT_BAR_CELLS: usize = 20;
+const WEEKLY_LIMIT_BAR_DAYS: usize = 7;
+const WEEKLY_LIMIT_DAY_GLYPHS: [&str; 6] = ["▁", "▂", "▃", "▄", "▅", "▆"];
 const WEEKLY_LIMIT_HOURS: f64 = 7.0 * 24.0;
-const WEEKLY_LIMIT_PERCENT_PER_HOUR: f64 = 100.0 / WEEKLY_LIMIT_HOURS;
-const WEEKLY_LIMIT_CELL_PERCENT: f64 = 100.0 / WEEKLY_LIMIT_BAR_CELLS as f64;
-const WEEKLY_LIMIT_WARNING_PERCENT: f64 = 5.0;
-const WEEKLY_LIMIT_CRITICAL_PERCENT: f64 = 10.0;
-const EPSILON: f64 = 0.000_001;
+const WEEKLY_LIMIT_DAY_PERCENT: f64 = 100.0 / WEEKLY_LIMIT_BAR_DAYS as f64;
+const WEEKLY_LIMIT_GREEN_THRESHOLD_HOURS: f64 = -36.0;
+const WEEKLY_LIMIT_YELLOW_THRESHOLD_HOURS: f64 = -60.0;
+const WEEKLY_LIMIT_RED_THRESHOLD_HOURS: f64 = -84.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WeeklyLimitBarStyle {
-    Scheduled(WeeklyLimitReserveStyle),
-    Surplus,
+    Remaining(WeeklyLimitRemainingStyle),
     Used,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WeeklyLimitReserveStyle {
-    Healthy,
+enum WeeklyLimitRemainingStyle {
+    Green,
     Warning,
+    Red,
     Critical,
 }
 
@@ -38,70 +38,73 @@ pub(crate) fn weekly_limit_status_line(
         let remaining = reset_at.signed_duration_since(now);
         remaining.max(ChronoDuration::zero())
     });
+    let reset_remaining_total_hours = reset_remaining
+        .map(|duration| duration.num_seconds().max(0) / 3_600)
+        .unwrap_or(0);
+    let reset_remaining_text = format!(
+        "{}d {}h",
+        reset_remaining_total_hours / 24,
+        reset_remaining_total_hours % 24
+    );
     let reset_remaining_hours =
         reset_remaining.map(|duration| duration.num_seconds() as f64 / 3_600.0);
-
-    let scheduled_target_remaining = reset_remaining_hours
-        .map(|hours| (hours.min(WEEKLY_LIMIT_HOURS) * WEEKLY_LIMIT_PERCENT_PER_HOUR).max(0.0))
-        .unwrap_or(0.0)
-        .min(100.0);
-    let scheduled_remaining = scheduled_target_remaining.min(percent_remaining);
-    let reserve_consumed = (scheduled_target_remaining - percent_remaining).max(0.0);
-    let reserve_style = if reserve_consumed > WEEKLY_LIMIT_CRITICAL_PERCENT {
-        WeeklyLimitReserveStyle::Critical
-    } else if reserve_consumed + EPSILON >= WEEKLY_LIMIT_WARNING_PERCENT {
-        WeeklyLimitReserveStyle::Warning
+    let remaining_hours = percent_remaining / 100.0 * WEEKLY_LIMIT_HOURS;
+    let reset_remaining_hours = reset_remaining_hours.unwrap_or(0.0);
+    let remaining_minus_reset_hours = remaining_hours - reset_remaining_hours;
+    let remaining_style = if remaining_minus_reset_hours > WEEKLY_LIMIT_GREEN_THRESHOLD_HOURS {
+        WeeklyLimitRemainingStyle::Green
+    } else if remaining_minus_reset_hours > WEEKLY_LIMIT_YELLOW_THRESHOLD_HOURS {
+        WeeklyLimitRemainingStyle::Warning
+    } else if remaining_minus_reset_hours > WEEKLY_LIMIT_RED_THRESHOLD_HOURS {
+        WeeklyLimitRemainingStyle::Red
     } else {
-        WeeklyLimitReserveStyle::Healthy
+        WeeklyLimitRemainingStyle::Critical
     };
 
-    let mut spans = Vec::with_capacity(WEEKLY_LIMIT_BAR_CELLS + 2);
-    spans.push("[".into());
-    for index in 0..WEEKLY_LIMIT_BAR_CELLS {
-        let cell_start = index as f64 * WEEKLY_LIMIT_CELL_PERCENT;
-        let cell_remaining = (percent_remaining - cell_start).clamp(0.0, WEEKLY_LIMIT_CELL_PERCENT);
-        let style = if cell_remaining <= 0.0 {
-            WeeklyLimitBarStyle::Used
+    let mut spans = Vec::with_capacity(WEEKLY_LIMIT_BAR_DAYS * 2 + 1);
+    for index in 0..WEEKLY_LIMIT_BAR_DAYS {
+        if index > 0 {
+            spans.push(" ".into());
+        }
+
+        let cell_start = index as f64 * WEEKLY_LIMIT_DAY_PERCENT;
+        let cell_remaining = (percent_remaining - cell_start).clamp(0.0, WEEKLY_LIMIT_DAY_PERCENT);
+        let style = if cell_remaining > 0.0 {
+            WeeklyLimitBarStyle::Remaining(remaining_style)
         } else {
-            let visible_midpoint = cell_start + (cell_remaining / 2.0);
-            if visible_midpoint <= scheduled_remaining + EPSILON {
-                WeeklyLimitBarStyle::Scheduled(reserve_style)
-            } else {
-                WeeklyLimitBarStyle::Surplus
-            }
+            WeeklyLimitBarStyle::Used
         };
         spans.push(styled_bar_cell(cell_remaining, style));
     }
-    spans.push("]".into());
+    spans.push(format!(" {reset_remaining_text}").into());
     Line::from(spans)
 }
 
 fn styled_bar_cell(percent_remaining: f64, style: WeeklyLimitBarStyle) -> Span<'static> {
     let glyph = if percent_remaining <= 0.0 {
-        " "
+        "▆"
     } else {
-        match percent_remaining.ceil() as i32 {
-            1 => "▁",
-            2 => "▂",
-            3 => "▃",
-            4 => "▄",
-            _ => "▆",
-        }
+        let level = ((percent_remaining / WEEKLY_LIMIT_DAY_PERCENT).clamp(0.0, 1.0)
+            * WEEKLY_LIMIT_DAY_GLYPHS.len() as f64)
+            .round() as usize;
+        WEEKLY_LIMIT_DAY_GLYPHS[level
+            .max(1)
+            .saturating_sub(1)
+            .min(WEEKLY_LIMIT_DAY_GLYPHS.len() - 1)]
     };
 
     match style {
-        WeeklyLimitBarStyle::Scheduled(WeeklyLimitReserveStyle::Healthy) => {
-            Span::from(glyph).green().dim()
+        WeeklyLimitBarStyle::Remaining(WeeklyLimitRemainingStyle::Green) => {
+            Span::from(glyph).green()
         }
-        // User-requested warning color for eating into scheduled weekly reserve.
         #[allow(clippy::disallowed_methods)]
-        WeeklyLimitBarStyle::Scheduled(WeeklyLimitReserveStyle::Warning) => {
-            Span::from(glyph).yellow().dim()
+        WeeklyLimitBarStyle::Remaining(WeeklyLimitRemainingStyle::Warning) => {
+            Span::from(glyph).yellow()
         }
-        WeeklyLimitBarStyle::Scheduled(WeeklyLimitReserveStyle::Critical) => {
-            Span::from(glyph).red().dim()
-        }
-        WeeklyLimitBarStyle::Surplus | WeeklyLimitBarStyle::Used => Span::from(glyph),
+        WeeklyLimitBarStyle::Remaining(
+            WeeklyLimitRemainingStyle::Red | WeeklyLimitRemainingStyle::Critical,
+        ) => Span::from(glyph).red(),
+        WeeklyLimitBarStyle::Used => Span::from(glyph),
     }
 }
 
@@ -109,8 +112,8 @@ fn styled_bar_cell(percent_remaining: f64, style: WeeklyLimitBarStyle) -> Span<'
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use pretty_assertions::assert_eq;
     use ratatui::style::Color;
-    use ratatui::style::Modifier;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -132,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_remaining_blocks_and_used_spaces() {
+    fn renders_remaining_days_and_used_days() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
@@ -142,75 +145,116 @@ mod tests {
             now,
         );
 
-        assert_eq!(line_text(&line), "[▆▆▆▆▆▆▆▆▆▆▆▆▆       ]");
+        assert_eq!(line_text(&line), "▆ ▆ ▆ ▆ ▃ ▆ ▆ 0d 0h");
     }
 
     #[test]
-    fn renders_partial_remaining_cell() {
+    fn renders_partial_remaining_day_and_reset_countdown() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let line = weekly_limit_status_line(
-            &weekly_window(/*used_percent*/ 36.0, /*reset_at*/ None),
-            now,
-        );
-
-        assert_eq!(line_text(&line), "[▆▆▆▆▆▆▆▆▆▆▆▆▄       ]");
-    }
-
-    #[test]
-    fn colors_scheduled_remaining_time_and_surplus() {
-        let now = Local
-            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
-            .single()
-            .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(72);
+        let reset_at = now + ChronoDuration::days(5) + ChronoDuration::hours(23);
         let line =
-            weekly_limit_status_line(&weekly_window(/*used_percent*/ 35.0, Some(reset_at)), now);
+            weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
-        let cells = &line.spans[1..=WEEKLY_LIMIT_BAR_CELLS];
+        assert_eq!(line_text(&line), "▆ ▆ ▃ ▆ ▆ ▆ ▆ 5d 23h");
+    }
+
+    #[test]
+    fn clamps_past_reset_countdown_to_zero() {
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let reset_at = now - ChronoDuration::hours(2);
+        let line =
+            weekly_limit_status_line(&weekly_window(/*used_percent*/ 100.0, Some(reset_at)), now);
+
+        assert_eq!(line_text(&line), "▆ ▆ ▆ ▆ ▆ ▆ ▆ 0d 0h");
+    }
+
+    #[test]
+    fn colors_remaining_green_when_remaining_time_is_within_one_and_half_days_of_reset() {
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let reset_at = now + ChronoDuration::hours(94);
+        let line =
+            weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
+
+        let cells: Vec<&Span<'_>> = line
+            .spans
+            .iter()
+            .filter(|span| span.content.as_ref() != " ")
+            .take(WEEKLY_LIMIT_BAR_DAYS)
+            .collect();
         assert_eq!(cells[0].style.fg, Some(Color::Green));
-        assert!(cells[0].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(cells[6].style.fg, Some(Color::Green));
-        assert!(cells[6].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(cells[10].style.fg, None);
-        assert!(!cells[10].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(cells[2].style.fg, Some(Color::Green));
+        assert_eq!(cells[3].style.fg, None);
     }
 
     #[test]
-    fn turns_scheduled_region_yellow_after_consuming_five_percent_of_reserve() {
+    fn colors_remaining_yellow_when_remaining_time_is_within_two_and_half_days_of_reset() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(84);
+        let reset_at = now + ChronoDuration::hours(110);
         let line =
-            weekly_limit_status_line(&weekly_window(/*used_percent*/ 55.0, Some(reset_at)), now);
+            weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
-        let cells = &line.spans[1..=WEEKLY_LIMIT_BAR_CELLS];
+        let cells: Vec<&Span<'_>> = line
+            .spans
+            .iter()
+            .filter(|span| span.content.as_ref() != " ")
+            .take(WEEKLY_LIMIT_BAR_DAYS)
+            .collect();
         assert_eq!(cells[0].style.fg, Some(Color::Yellow));
-        assert!(cells[0].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(cells[8].style.fg, Some(Color::Yellow));
-        assert!(cells[8].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(cells[9].style.fg, None);
+        assert_eq!(cells[2].style.fg, Some(Color::Yellow));
+        assert_eq!(cells[3].style.fg, None);
     }
 
     #[test]
-    fn turns_scheduled_region_red_after_consuming_more_than_ten_percent_of_reserve() {
+    fn colors_remaining_red_when_remaining_time_is_within_three_and_half_days_of_reset() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(84);
+        let reset_at = now + ChronoDuration::hours(140);
         let line =
-            weekly_limit_status_line(&weekly_window(/*used_percent*/ 61.0, Some(reset_at)), now);
+            weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
-        let cells = &line.spans[1..=WEEKLY_LIMIT_BAR_CELLS];
+        let cells: Vec<&Span<'_>> = line
+            .spans
+            .iter()
+            .filter(|span| span.content.as_ref() != " ")
+            .take(WEEKLY_LIMIT_BAR_DAYS)
+            .collect();
         assert_eq!(cells[0].style.fg, Some(Color::Red));
-        assert!(cells[0].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(cells[7].style.fg, Some(Color::Red));
-        assert!(cells[7].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(cells[8].style.fg, None);
+        assert_eq!(cells[2].style.fg, Some(Color::Red));
+        assert_eq!(cells[3].style.fg, None);
+    }
+
+    #[test]
+    fn colors_remaining_red_when_remaining_time_lags_past_three_and_half_days() {
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let reset_at = now + ChronoDuration::hours(150);
+        let line =
+            weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
+
+        let cells: Vec<&Span<'_>> = line
+            .spans
+            .iter()
+            .filter(|span| span.content.as_ref() != " ")
+            .take(WEEKLY_LIMIT_BAR_DAYS)
+            .collect();
+        assert_eq!(cells[0].style.fg, Some(Color::Red));
+        assert_eq!(cells[2].style.fg, Some(Color::Red));
+        assert_eq!(cells[3].style.fg, None);
     }
 }

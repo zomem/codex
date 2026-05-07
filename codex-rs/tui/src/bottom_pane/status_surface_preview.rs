@@ -40,7 +40,7 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
             StatusSurfacePreviewItem::FiveHourLimit => "5h 0%",
-            StatusSurfacePreviewItem::WeeklyLimit => "[                    ]",
+            StatusSurfacePreviewItem::WeeklyLimit => "▆ ▆ ▃ ▆ ▆ ▆ ▆ 5d 23h",
             StatusSurfacePreviewItem::CodexVersion => "0.0.0",
             StatusSurfacePreviewItem::ContextWindowSize => "0 window",
             StatusSurfacePreviewItem::UsedTokens => "0 used",

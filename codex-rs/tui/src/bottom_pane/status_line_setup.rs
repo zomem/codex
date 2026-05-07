@@ -529,7 +529,7 @@ mod tests {
                 ),
                 (
                     StatusLineItem::WeeklyLimit.preview_item(),
-                    "[▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▂   ]".to_string(),
+                    "▆ ▆ ▃ ▆ ▆ ▆ ▆ 5d 23h".to_string(),
                 ),
             ]),
             AppEventSender::new(tx_raw),
