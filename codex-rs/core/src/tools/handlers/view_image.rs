@@ -1,3 +1,5 @@
+use codex_protocol::items::ImageViewItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -15,12 +17,32 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
+use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ViewImageToolCallEvent;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 
-pub struct ViewImageHandler;
+pub struct ViewImageHandler {
+    options: ViewImageToolOptions,
+}
+
+impl Default for ViewImageHandler {
+    fn default() -> Self {
+        Self {
+            options: ViewImageToolOptions {
+                can_request_original_image_detail: false,
+            },
+        }
+    }
+}
+
+impl ViewImageHandler {
+    pub(crate) fn new(options: ViewImageToolOptions) -> Self {
+        Self { options }
+    }
+}
 
 const VIEW_IMAGE_UNSUPPORTED_MESSAGE: &str =
     "view_image is not allowed because you do not support image inputs";
@@ -38,6 +60,18 @@ enum ViewImageDetail {
 
 impl ToolHandler for ViewImageHandler {
     type Output = ViewImageOutput;
+
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("view_image")
+    }
+
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_view_image_tool(self.options))
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
 
     fn kind(&self) -> ToolKind {
         ToolKind::Function
@@ -88,16 +122,18 @@ impl ToolHandler for ViewImageHandler {
         };
 
         let abs_path = turn.resolve_path(Some(args.path));
-        let Some(environment) = turn.environment.as_ref() else {
+        let Some(environment) = turn.environments.primary() else {
             return Err(FunctionCallError::RespondToModel(
                 "view_image is unavailable in this session".to_string(),
             ));
         };
         let sandbox = environment
+            .environment
             .is_remote()
             .then(|| turn.file_system_sandbox_context(/*additional_permissions*/ None));
 
         let metadata = environment
+            .environment
             .get_filesystem()
             .get_metadata(&abs_path, sandbox.as_ref())
             .await
@@ -115,6 +151,7 @@ impl ToolHandler for ViewImageHandler {
             )));
         }
         let file_bytes = environment
+            .environment
             .get_filesystem()
             .read_file(&abs_path, sandbox.as_ref())
             .await
@@ -149,15 +186,12 @@ impl ToolHandler for ViewImageHandler {
             })?;
         let image_url = image.into_data_url();
 
-        session
-            .send_event(
-                turn.as_ref(),
-                EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
-                    call_id,
-                    path: event_path,
-                }),
-            )
-            .await;
+        let item = TurnItem::ImageView(ImageViewItem {
+            id: call_id,
+            path: event_path,
+        });
+        session.emit_turn_item_started(turn.as_ref(), &item).await;
+        session.emit_turn_item_completed(turn.as_ref(), item).await;
 
         Ok(ViewImageOutput {
             image_url,

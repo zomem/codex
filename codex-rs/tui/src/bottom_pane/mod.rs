@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::app::app_server_requests::ResolvedAppServerRequest;
+use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::pending_input_preview::PendingInputPreview;
@@ -36,6 +37,7 @@ use codex_core_skills::model::SkillMetadata;
 use codex_features::Features;
 use codex_file_search::FileMatch;
 use codex_plugin::PluginCapabilitySummary;
+use codex_protocol::ThreadId;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -53,6 +55,7 @@ mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
 mod status_line_setup;
+mod status_line_style;
 mod status_surface_preview;
 mod title_setup;
 pub(crate) use action_required_title::ACTION_REQUIRED_PREVIEW_PREFIX;
@@ -67,6 +70,7 @@ pub(crate) use approval_overlay::format_requested_permissions_rule;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
+pub(crate) use status_line_style::status_line_from_segments;
 mod bottom_pane_view;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +208,7 @@ pub(crate) struct BottomPane {
 
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
+    thread_id: Option<ThreadId>,
 
     has_input_focus: bool,
     enhanced_keys_supported: bool,
@@ -269,6 +274,7 @@ impl BottomPane {
             last_composer_activity_at: None,
             app_event_tx,
             frame_requester,
+            thread_id: None,
             has_input_focus,
             enhanced_keys_supported,
             disable_paste_burst,
@@ -378,6 +384,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub fn set_ide_context_active(&mut self, active: bool) {
+        self.composer.set_ide_context_active(active);
+        self.request_redraw();
+    }
+
     pub fn set_personality_command_enabled(&mut self, enabled: bool) {
         self.composer.set_personality_command_enabled(enabled);
         self.request_redraw();
@@ -420,6 +431,17 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
+        self.composer.set_vim_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub(crate) fn toggle_vim_enabled(&mut self) -> bool {
+        let enabled = self.composer.toggle_vim_enabled();
+        self.request_redraw();
+        enabled
+    }
+
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
         self.status.as_ref()
     }
@@ -448,6 +470,7 @@ impl BottomPane {
 
     fn push_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.view_stack.push(view);
+        self.schedule_active_view_frame();
         self.request_redraw();
     }
 
@@ -590,6 +613,7 @@ impl BottomPane {
                 && self.is_task_running
                 && !is_agent_command
                 && !self.composer.popup_active()
+                && !self.composer_should_handle_vim_insert_escape(key_event)
                 && let Some(status) = &self.status
             {
                 // Send Op::Interrupt
@@ -695,6 +719,16 @@ impl BottomPane {
     fn pre_draw_tick_at(&mut self, now: Instant) {
         self.composer.sync_popups();
         self.maybe_show_delayed_approval_requests_at(now);
+        self.schedule_active_view_frame();
+    }
+
+    fn schedule_active_view_frame(&self) {
+        if let Some(delay) = self
+            .active_view()
+            .and_then(BottomPaneView::next_frame_delay)
+        {
+            self.request_redraw_in(delay);
+        }
     }
 
     /// Replace the composer text with `text`.
@@ -746,7 +780,16 @@ impl BottomPane {
     }
 
     pub(crate) fn clear_composer_for_ctrl_c(&mut self) {
-        self.composer.clear_for_ctrl_c();
+        if let Some(text) = self.composer.clear_for_ctrl_c() {
+            if let Some(thread_id) = self.thread_id {
+                self.app_event_tx
+                    .send(AppEvent::AppendMessageHistoryEntry { thread_id, text });
+            } else {
+                tracing::warn!(
+                    "failed to append Ctrl+C-cleared draft to history: no active thread id"
+                );
+            }
+        }
         self.request_redraw();
     }
 
@@ -1125,6 +1168,15 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn composer_is_vim_enabled(&self) -> bool {
+        self.composer.is_vim_enabled()
+    }
+
+    pub(crate) fn composer_should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
+        self.composer.should_handle_vim_insert_escape(key_event)
+    }
+
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
     }
@@ -1276,6 +1328,12 @@ impl BottomPane {
                         AppLinkSuggestionType::Enable => {
                             "Enable this app to use it for the current request.".to_string()
                         }
+                        AppLinkSuggestionType::Auth => unreachable!(
+                            "auth uses URL mode elicitation, not tool suggestion forms"
+                        ),
+                        AppLinkSuggestionType::ExternalAction => unreachable!(
+                            "external actions use URL mode elicitation, not tool suggestion forms"
+                        ),
                     },
                     url: install_url,
                     is_installed,
@@ -1381,8 +1439,15 @@ impl BottomPane {
 
     // --- History helpers ---
 
-    pub(crate) fn set_history_metadata(&mut self, log_id: u64, entry_count: usize) {
-        self.composer.set_history_metadata(log_id, entry_count);
+    pub(crate) fn set_history_metadata(
+        &mut self,
+        thread_id: ThreadId,
+        log_id: u64,
+        entry_count: usize,
+    ) {
+        self.thread_id = Some(thread_id);
+        self.composer
+            .set_history_metadata(thread_id, log_id, entry_count);
     }
 
     pub(crate) fn flush_paste_burst_if_due(&mut self) -> bool {
@@ -1505,6 +1570,12 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn set_status_line_hyperlink(&mut self, url: Option<String>) {
+        if self.composer.set_status_line_hyperlink(url) {
+            self.request_redraw();
+        }
+    }
+
     pub(crate) fn set_status_line_enabled(&mut self, enabled: bool) {
         if self.composer.set_status_line_enabled(enabled) {
             self.request_redraw();
@@ -1562,6 +1633,10 @@ impl Renderable for BottomPane {
     }
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.as_renderable().cursor_pos(area)
+    }
+
+    fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
+        self.as_renderable().cursor_style(area)
     }
 }
 
@@ -2359,6 +2434,7 @@ mod tests {
                 policy: None,
                 path_to_skills_md: test_path_buf("/tmp/test-skill/SKILL.md").abs(),
                 scope: crate::test_support::skill_scope_user(),
+                plugin_id: None,
             }]),
         });
 

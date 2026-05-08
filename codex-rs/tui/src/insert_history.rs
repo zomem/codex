@@ -128,6 +128,12 @@ impl InsertHistoryMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryLineWrapPolicy {
+    PreWrap,
+    Terminal,
+}
+
 /// Insert `lines` above the viewport using the terminal's backend writer
 /// (avoids direct stdout references).
 pub fn insert_history_lines<B>(
@@ -157,6 +163,23 @@ pub fn insert_history_lines_with_mode<B>(
 where
     B: Backend + Write,
 {
+    insert_history_lines_with_mode_and_wrap_policy(
+        terminal,
+        lines,
+        mode,
+        HistoryLineWrapPolicy::PreWrap,
+    )
+}
+
+pub fn insert_history_lines_with_mode_and_wrap_policy<B>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+    lines: Vec<Line>,
+    mode: InsertHistoryMode,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> io::Result<()>
+where
+    B: Backend + Write,
+{
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
 
     let mut area = terminal.viewport_area;
@@ -176,7 +199,7 @@ where
     // - Non-URL lines also flow through adaptive wrapping; behavior is
     //   equivalent to standard wrapping when no URL is present.
     let wrap_width = area.width.max(1) as usize;
-    let (wrapped, wrapped_rows) = prepare_history_lines(&lines, wrap_width);
+    let (wrapped, wrapped_rows) = prepare_history_lines(&lines, wrap_width, wrap_policy);
     let wrapped_lines = u16::try_from(wrapped_rows).unwrap_or(u16::MAX);
     let sixel_count = wrapped
         .iter()
@@ -373,6 +396,7 @@ where
 fn prepare_history_lines(
     lines: &[Line<'_>],
     wrap_width: usize,
+    wrap_policy: HistoryLineWrapPolicy,
 ) -> (Vec<PreparedHistoryLine>, usize) {
     let mut wrapped = Vec::new();
     let mut wrapped_rows = 0usize;
@@ -405,12 +429,15 @@ fn prepare_history_lines(
             continue;
         }
 
-        let line_wrapped =
-            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
+        let line_wrapped = match wrap_policy {
+            HistoryLineWrapPolicy::Terminal => vec![line.clone()],
+            HistoryLineWrapPolicy::PreWrap
+                if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) =>
+            {
                 vec![line.clone()]
-            } else {
-                adaptive_wrap_line(line, RtOptions::new(wrap_width))
-            };
+            }
+            HistoryLineWrapPolicy::PreWrap => adaptive_wrap_line(line, RtOptions::new(wrap_width)),
+        };
         for wrapped_line in line_wrapped {
             wrapped_rows += wrapped_line.width().max(1).div_ceil(wrap_width);
             wrapped.push(PreparedHistoryLine::Text(line_to_static(&wrapped_line)));
@@ -1458,6 +1485,33 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("tail words")),
             "expected suffix words to wrap as a phrase, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn vt100_terminal_wrap_policy_does_not_pre_wrap_long_paragraph() {
+        let width: u16 = 20;
+        let height: u16 = 8;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(0, height - 1, width, 1);
+        term.set_viewport_area(viewport);
+
+        let line = Line::from("alpha beta gamma delta epsilon zeta");
+
+        insert_history_lines_with_mode_and_wrap_policy(
+            &mut term,
+            vec![line],
+            InsertHistoryMode::Standard,
+            HistoryLineWrapPolicy::Terminal,
+        )
+        .expect("insert raw history");
+
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_end() == "alpha beta gamma del"),
+            "expected terminal soft-wrap instead of Codex word pre-wrap, rows: {rows:?}"
         );
     }
 
