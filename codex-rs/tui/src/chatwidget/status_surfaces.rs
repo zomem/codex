@@ -8,6 +8,7 @@ use crate::bottom_pane::status_line_from_segments;
 use crate::branch_summary;
 use crate::status::format_tokens_compact;
 use crate::status::weekly_limit_status_line;
+use ratatui::text::Line;
 
 /// Items shown in the terminal title when the user has not configured a
 /// custom selection. Intentionally minimal: activity indicator + project name.
@@ -174,8 +175,18 @@ impl ChatWidget {
 
         let mut segments = Vec::new();
         for item in &selections.status_line_items {
-            if let Some(value) = self.status_line_value_for_item(*item) {
-                segments.push((*item, value));
+            let line = match item {
+                StatusLineItem::WeeklyLimit => {
+                    let window = self
+                        .rate_limit_snapshots_by_limit_id
+                        .get("codex")
+                        .and_then(|s| s.secondary.as_ref());
+                    window.map(|window| weekly_limit_status_line(window, Local::now()))
+                }
+                _ => self.status_line_value_for_item(*item).map(Line::from),
+            };
+            if let Some(line) = line {
+                segments.push((*item, line));
             }
         }
 

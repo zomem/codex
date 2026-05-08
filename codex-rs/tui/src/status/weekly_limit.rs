@@ -11,9 +11,9 @@ const WEEKLY_LIMIT_BAR_DAYS: usize = 7;
 const WEEKLY_LIMIT_DAY_GLYPHS: [&str; 6] = ["▁", "▂", "▃", "▄", "▅", "▆"];
 const WEEKLY_LIMIT_HOURS: f64 = 7.0 * 24.0;
 const WEEKLY_LIMIT_DAY_PERCENT: f64 = 100.0 / WEEKLY_LIMIT_BAR_DAYS as f64;
-const WEEKLY_LIMIT_GREEN_THRESHOLD_HOURS: f64 = -36.0;
-const WEEKLY_LIMIT_YELLOW_THRESHOLD_HOURS: f64 = -60.0;
-const WEEKLY_LIMIT_RED_THRESHOLD_HOURS: f64 = -84.0;
+const WEEKLY_LIMIT_GREEN_THRESHOLD_HOURS: f64 = -12.0;
+const WEEKLY_LIMIT_YELLOW_THRESHOLD_HOURS: f64 = -36.0;
+const WEEKLY_LIMIT_RED_THRESHOLD_HOURS: f64 = -60.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WeeklyLimitBarStyle {
@@ -175,12 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn colors_remaining_green_when_remaining_time_is_within_one_and_half_days_of_reset() {
+    fn colors_remaining_green_when_remaining_time_is_within_half_day_of_reset() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(94);
+        let reset_at = now + ChronoDuration::hours(68);
         let line =
             weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
@@ -196,12 +196,12 @@ mod tests {
     }
 
     #[test]
-    fn colors_remaining_yellow_when_remaining_time_is_within_two_and_half_days_of_reset() {
+    fn colors_remaining_yellow_when_remaining_time_is_within_one_and_half_days_of_reset() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(110);
+        let reset_at = now + ChronoDuration::hours(90);
         let line =
             weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
@@ -217,12 +217,12 @@ mod tests {
     }
 
     #[test]
-    fn colors_remaining_red_when_remaining_time_is_within_three_and_half_days_of_reset() {
+    fn colors_remaining_red_when_remaining_time_is_within_two_and_half_days_of_reset() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(140);
+        let reset_at = now + ChronoDuration::hours(110);
         let line =
             weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
@@ -238,12 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn colors_remaining_red_when_remaining_time_lags_past_three_and_half_days() {
+    fn colors_remaining_red_when_remaining_time_lags_past_two_and_half_days() {
         let now = Local
             .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
             .single()
             .expect("timestamp");
-        let reset_at = now + ChronoDuration::hours(150);
+        let reset_at = now + ChronoDuration::hours(120);
         let line =
             weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 

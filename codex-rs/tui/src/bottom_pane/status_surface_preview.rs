@@ -177,7 +177,7 @@ impl StatusSurfacePreviewData {
     {
         let segments = items.into_iter().filter_map(|item| {
             self.value_for(item.preview_item())
-                .map(|value| (item, value.to_string()))
+                .map(|value| (item, Line::from(value.to_string())))
         });
         status_line_from_segments(segments, use_theme_colors)
     }
