@@ -82,7 +82,7 @@ pub(crate) fn weekly_limit_status_line(
 
 fn styled_bar_cell(percent_remaining: f64, style: WeeklyLimitBarStyle) -> Span<'static> {
     let glyph = if percent_remaining <= 0.0 {
-        "▆"
+        "▁"
     } else {
         let level = ((percent_remaining / WEEKLY_LIMIT_DAY_PERCENT).clamp(0.0, 1.0)
             * WEEKLY_LIMIT_DAY_GLYPHS.len() as f64)
@@ -145,7 +145,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(line_text(&line), "▆ ▆ ▆ ▆ ▃ ▆ ▆ 0d 0h");
+        assert_eq!(line_text(&line), "▆ ▆ ▆ ▆ ▃ ▁ ▁ 0d 0h");
     }
 
     #[test]
@@ -158,7 +158,7 @@ mod tests {
         let line =
             weekly_limit_status_line(&weekly_window(/*used_percent*/ 65.0, Some(reset_at)), now);
 
-        assert_eq!(line_text(&line), "▆ ▆ ▃ ▆ ▆ ▆ ▆ 5d 23h");
+        assert_eq!(line_text(&line), "▆ ▆ ▃ ▁ ▁ ▁ ▁ 5d 23h");
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
         let line =
             weekly_limit_status_line(&weekly_window(/*used_percent*/ 100.0, Some(reset_at)), now);
 
-        assert_eq!(line_text(&line), "▆ ▆ ▆ ▆ ▆ ▆ ▆ 0d 0h");
+        assert_eq!(line_text(&line), "▁ ▁ ▁ ▁ ▁ ▁ ▁ 0d 0h");
     }
 
     #[test]

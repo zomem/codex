@@ -54,7 +54,7 @@ use pulldown_cmark::Options;
 use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
-use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -1182,7 +1182,7 @@ where
             &column_widths,
             &table_state.alignments,
             border_style,
-            Some(Style::default().fg(Color::Yellow)),
+            Some(Style::default().add_modifier(Modifier::BOLD)),
         ));
         out.push(self.render_border_line('├', '┼', '┤', &column_widths, border_style));
         for (index, row) in rows.iter().enumerate() {

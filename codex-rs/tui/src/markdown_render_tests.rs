@@ -1,5 +1,5 @@
 use pretty_assertions::assert_eq;
-use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -867,7 +867,7 @@ fn table_renders_grid() {
 }
 
 #[test]
-fn table_header_text_is_yellow() {
+fn table_header_text_is_bold_default_color() {
     let text = render_markdown_text("| Left | Right |\n|------|------:|\n| a | b |\n");
     let header_line = text.lines.get(1).expect("header row should render");
     let body_line = text.lines.get(3).expect("body row should render");
@@ -877,16 +877,17 @@ fn table_header_text_is_yellow() {
             .spans
             .iter()
             .filter(|span| span.content.contains("Left") || span.content.contains("Right"))
-            .all(|span| span.style.fg == Some(Color::Yellow)),
-        "expected table header text to be yellow"
+            .all(|span| span.style.fg.is_none()
+                && span.style.add_modifier.contains(Modifier::BOLD)),
+        "expected table header text to use the default foreground and bold"
     );
     assert!(
         body_line
             .spans
             .iter()
             .filter(|span| span.content.contains('a') || span.content.contains('b'))
-            .all(|span| span.style.fg != Some(Color::Yellow)),
-        "expected table body text to keep its original foreground"
+            .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
+        "expected table body text to keep its original weight"
     );
 }
 

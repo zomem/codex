@@ -1380,7 +1380,7 @@ Run codex doctor without --summary for detailed diagnostics.
                     "update configuration is locally consistent",
                 )
                 .detail("latest version status: newer version is available")
-                .detail("latest version: 0.130.0")
+                .detail("latest version: 0.131.0")
                 .detail("dismissed version: 0.128.0"),
                 DoctorCheck::new(
                     "state.paths",
@@ -1432,7 +1432,7 @@ Run codex doctor without --summary for detailed diagnostics.
         let rendered = render_human_report(&report, summary_no_color_unicode_options());
 
         assert!(rendered.contains("Notes\n   ↑ updates"));
-        assert!(rendered.contains("0.130.0 available (current 0.0.0, dismissed 0.128.0)"));
+        assert!(rendered.contains("0.131.0 available (current 0.0.0, dismissed 0.128.0)"));
         assert!(rendered.contains("⚠ rollouts"));
         assert!(rendered.contains("⚠ sandbox"));
         assert!(rendered.contains("⚠ mcp"));
@@ -1489,11 +1489,11 @@ Run codex doctor without --summary for detailed diagnostics.
     #[test]
     fn update_note_emphasizes_available_version_and_dims_context() {
         let rendered = style_update_note_summary(
-            "0.130.0 available (current 0.0.0, dismissed 0.128.0)",
+            "0.131.0 available (current 0.0.0, dismissed 0.128.0)",
             detailed_color_unicode_options(),
         );
 
-        assert!(rendered.contains("\u{1b}[38;5;220m0.130.0 available"));
+        assert!(rendered.contains("\u{1b}[38;5;220m0.131.0 available"));
         assert!(rendered.contains("\u{1b}[2m(current 0.0.0, dismissed 0.128.0)"));
     }
 

@@ -1812,7 +1812,7 @@ async fn status_line_weekly_limit_renders_remaining_bar() {
 
     assert_eq!(
         status_line_text(&chat),
-        Some("▆ ▆ ▆ ▆ ▃ ▆ ▆ 0d 0h".to_string())
+        Some("▆ ▆ ▆ ▆ ▃ ▁ ▁ 0d 0h".to_string())
     );
 }
 
