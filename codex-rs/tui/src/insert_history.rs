@@ -436,7 +436,10 @@ fn prepare_history_lines(
             {
                 vec![line.clone()]
             }
-            HistoryLineWrapPolicy::PreWrap => adaptive_wrap_line(line, RtOptions::new(wrap_width)),
+            HistoryLineWrapPolicy::PreWrap => adaptive_wrap_line(
+                line,
+                RtOptions::new(wrap_width).subsequent_indent(leading_whitespace_prefix(line)),
+            ),
         };
         for wrapped_line in line_wrapped {
             wrapped_rows += wrapped_line.width().max(1).div_ceil(wrap_width);
@@ -445,6 +448,27 @@ fn prepare_history_lines(
     }
 
     (wrapped, wrapped_rows)
+}
+
+fn leading_whitespace_prefix(line: &Line<'_>) -> Line<'static> {
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let prefix_end = span
+            .content
+            .char_indices()
+            .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+            .unwrap_or(span.content.len());
+        if prefix_end > 0 {
+            spans.push(Span::styled(
+                span.content[..prefix_end].to_string(),
+                span.style,
+            ));
+        }
+        if prefix_end < span.content.len() {
+            break;
+        }
+    }
+    Line::from(spans).style(line.style)
 }
 
 fn write_prepared_history_line<W: Write>(

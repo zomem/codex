@@ -16,6 +16,8 @@ use codex_protocol::models::PermissionProfile;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use ratatui::text::Line;
 
+use super::status_state::TerminalTitleStatusKind;
+
 /// Items shown in the terminal title when the user has not configured a
 /// custom selection. Intentionally minimal: activity indicator + project name.
 pub(super) const DEFAULT_TERMINAL_TITLE_ITEMS: [&str; 2] = ["activity", "project-name"];
@@ -33,19 +35,6 @@ const TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL: Duration = Duration::from_secs(1)
 /// Prefix shown in the terminal title when the agent is blocked on user input.
 const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX: &str = "[ ! ] Action Required";
 const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Required";
-
-/// Compact runtime states that can be rendered into the terminal title.
-///
-/// This is intentionally smaller than the full status-header vocabulary. The
-/// title needs short, stable labels, so callers map richer lifecycle events
-/// onto one of these buckets before rendering.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum TerminalTitleStatusKind {
-    Working,
-    WaitingForBackgroundTerminal,
-    #[default]
-    Thinking,
-}
 
 #[derive(Debug)]
 /// Parsed status-surface configuration for one refresh pass.
@@ -817,7 +806,7 @@ impl ChatWidget {
             return "Starting".to_string();
         }
 
-        match self.terminal_title_status_kind {
+        match self.status_state.terminal_title_status_kind {
             TerminalTitleStatusKind::Working if !self.bottom_pane.is_task_running() => {
                 "Ready".to_string()
             }
@@ -893,7 +882,7 @@ impl ChatWidget {
 
     /// Formats the last `update_plan` progress snapshot for terminal-title display.
     pub(super) fn terminal_title_task_progress(&self) -> Option<String> {
-        let (completed, total) = self.last_plan_progress?;
+        let (completed, total) = self.transcript.last_plan_progress?;
         if total == 0 {
             return None;
         }
@@ -926,8 +915,10 @@ fn permissions_display(config: &Config) -> String {
         return active_permission_profile.id.clone();
     }
 
-    let permission_profile = config.permissions.permission_profile();
-    let summary = summarize_permission_profile(&permission_profile, config.cwd.as_path());
+    let permission_profile = config.permissions.effective_permission_profile();
+    let workspace_roots = config.effective_workspace_roots();
+    let summary =
+        summarize_permission_profile(&permission_profile, &config.cwd, workspace_roots.as_slice());
     if let Some(details) = summary.strip_prefix("read-only")
         && !details.contains("(network access enabled)")
     {
