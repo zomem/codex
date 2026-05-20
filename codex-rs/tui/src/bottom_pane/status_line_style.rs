@@ -4,6 +4,7 @@ use ratatui::prelude::Stylize;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::text::Line;
+use ratatui::text::Span;
 
 use super::status_line_setup::StatusLineItem;
 use crate::render::highlight::foreground_style_for_scopes;
@@ -80,7 +81,7 @@ pub(crate) fn status_line_from_segments<I>(
     use_theme_colors: bool,
 ) -> Option<Line<'static>>
 where
-    I: IntoIterator<Item = (StatusLineItem, Line<'static>)>,
+    I: IntoIterator<Item = (StatusLineItem, String)>,
 {
     status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
         foreground_style_for_scopes(accent.scopes())
@@ -93,11 +94,11 @@ fn status_line_from_segments_with_resolver<I, F>(
     theme_style_for_accent: F,
 ) -> Option<Line<'static>>
 where
-    I: IntoIterator<Item = (StatusLineItem, Line<'static>)>,
+    I: IntoIterator<Item = (StatusLineItem, String)>,
     F: Fn(StatusLineAccent) -> Option<Style>,
 {
     let mut spans = Vec::new();
-    for (item, line) in segments {
+    for (item, text) in segments {
         if !spans.is_empty() {
             spans.push(STATUS_LINE_SEPARATOR.dim());
         }
@@ -114,19 +115,7 @@ where
         } else {
             style
         };
-        if item == StatusLineItem::WeeklyLimit {
-            spans.extend(line.spans.into_iter().map(|span| {
-                let is_limit_bar_glyph =
-                    matches!(span.content.as_ref(), "▁" | "▂" | "▃" | "▄" | "▅" | "▆");
-                if is_limit_bar_glyph {
-                    span.patch_style(Style::default().dim())
-                } else {
-                    span.patch_style(style)
-                }
-            }));
-            continue;
-        }
-        spans.extend(line.spans.into_iter().map(|span| span.patch_style(style)));
+        spans.push(Span::styled(text, style));
     }
 
     (!spans.is_empty()).then(|| Line::from(spans))
@@ -190,7 +179,6 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use ratatui::style::Modifier;
-    use ratatui::text::Span;
 
     fn line_text(line: &Line<'static>) -> String {
         line.spans
@@ -203,9 +191,9 @@ mod tests {
     fn status_line_segments_preserve_order_and_plain_text() {
         let line = status_line_from_segments_with_resolver(
             [
-                (StatusLineItem::ModelName, Line::from("gpt-5")),
-                (StatusLineItem::CurrentDir, Line::from("/repo")),
-                (StatusLineItem::GitBranch, Line::from("main")),
+                (StatusLineItem::ModelName, "gpt-5".to_string()),
+                (StatusLineItem::CurrentDir, "/repo".to_string()),
+                (StatusLineItem::GitBranch, "main".to_string()),
             ],
             /*use_theme_colors*/ true,
             |_| None,
@@ -225,8 +213,8 @@ mod tests {
     fn status_line_segments_dim_separators_and_use_theme_styles_first() {
         let line = status_line_from_segments_with_resolver(
             [
-                (StatusLineItem::ModelName, Line::from("gpt-5")),
-                (StatusLineItem::ContextUsed, Line::from("Context 12% used")),
+                (StatusLineItem::ModelName, "gpt-5".to_string()),
+                (StatusLineItem::ContextUsed, "Context 12% used".to_string()),
             ],
             /*use_theme_colors*/ true,
             |accent| match accent {
@@ -247,7 +235,7 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     fn status_line_segments_soften_rgb_theme_styles_without_dimming_text() {
         let line = status_line_from_segments_with_resolver(
-            [(StatusLineItem::ModelName, Line::from("gpt-5"))],
+            [(StatusLineItem::ModelName, "gpt-5".to_string())],
             /*use_theme_colors*/ true,
             |_| Some(Style::default().fg(Color::Rgb(255, 0, 0))),
         )
@@ -261,8 +249,8 @@ mod tests {
     fn status_line_segments_can_disable_theme_colors() {
         let line = status_line_from_segments_with_resolver(
             [
-                (StatusLineItem::ModelName, Line::from("gpt-5")),
-                (StatusLineItem::ContextUsed, Line::from("Context 12% used")),
+                (StatusLineItem::ModelName, "gpt-5".to_string()),
+                (StatusLineItem::ContextUsed, "Context 12% used".to_string()),
             ],
             /*use_theme_colors*/ false,
             |_| Some(Style::default().red()),
@@ -280,7 +268,7 @@ mod tests {
     #[test]
     fn pull_request_number_uses_link_style() {
         let line = status_line_from_segments_with_resolver(
-            [(StatusLineItem::PullRequestNumber, Line::from("PR #20252"))],
+            [(StatusLineItem::PullRequestNumber, "PR #20252".to_string())],
             /*use_theme_colors*/ false,
             |_| None,
         )
@@ -297,36 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn weekly_limit_segment_preserves_bar_colors_and_themes_reset_time() {
-        let line = status_line_from_segments_with_resolver(
-            [(
-                StatusLineItem::WeeklyLimit,
-                Line::from(vec![
-                    Span::from("▆").green(),
-                    Span::from(" "),
-                    Span::from("▃").yellow(),
-                    Span::from(" 3d 22h"),
-                ]),
-            )],
-            /*use_theme_colors*/ true,
-            |_| Some(Style::default().magenta()),
-        )
-        .expect("status line");
-
-        assert_eq!(line_text(&line), "▆ ▃ 3d 22h");
-        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
-        assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
-        assert!(line.spans[2].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(line.spans[3].style.fg, Some(Color::Magenta));
-        assert!(!line.spans[3].style.add_modifier.contains(Modifier::DIM));
-    }
-
-    #[test]
     fn status_line_segments_return_none_when_empty() {
         assert_eq!(
             status_line_from_segments_with_resolver(
-                Vec::<(StatusLineItem, Line<'static>)>::new(),
+                Vec::<(StatusLineItem, String)>::new(),
                 /*use_theme_colors*/ true,
                 |_| None,
             ),

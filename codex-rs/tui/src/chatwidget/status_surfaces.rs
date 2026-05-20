@@ -6,15 +6,15 @@
 use super::*;
 use crate::bottom_pane::status_line_from_segments;
 use crate::branch_summary;
+use crate::chatwidget::limit_label_for_window;
+use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
 use crate::status::format_tokens_compact;
-use crate::status::weekly_limit_status_line;
 use codex_app_server_protocol::AskForApproval;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_sandbox_summary::summarize_permission_profile;
-use ratatui::text::Line;
 
 use super::status_state::TerminalTitleStatusKind;
 
@@ -170,18 +170,8 @@ impl ChatWidget {
 
         let mut segments = Vec::new();
         for item in &selections.status_line_items {
-            let line = match item {
-                StatusLineItem::WeeklyLimit => {
-                    let window = self
-                        .rate_limit_snapshots_by_limit_id
-                        .get("codex")
-                        .and_then(|s| s.secondary.as_ref());
-                    window.map(|window| weekly_limit_status_line(window, Local::now()))
-                }
-                _ => self.status_line_value_for_item(*item).map(Line::from),
-            };
-            if let Some(line) = line {
-                segments.push((*item, line));
+            if let Some(value) = self.status_line_value_for_item(*item) {
+                segments.push((*item, value));
             }
         }
 
@@ -615,28 +605,20 @@ impl ChatWidget {
                 .status_line_context_used_percent()
                 .map(|used| format!("Context {used}% used")),
             StatusLineItem::FiveHourLimit => {
-                let window = self
+                let (window, is_secondary) = self
                     .rate_limit_snapshots_by_limit_id
                     .get("codex")
-                    .and_then(|s| s.primary.as_ref());
-                let label = window
-                    .and_then(|window| window.window_minutes)
-                    .map(get_limits_duration)
-                    .unwrap_or_else(|| "5h".to_string());
-                self.status_line_limit_display(window, &label)
+                    .and_then(five_hour_status_window)?;
+                let label = limit_label_for_window(window.window_minutes, is_secondary);
+                self.status_line_limit_display(Some(window), &label)
             }
             StatusLineItem::WeeklyLimit => {
-                let window = self
+                let (window, is_secondary) = self
                     .rate_limit_snapshots_by_limit_id
                     .get("codex")
-                    .and_then(|s| s.secondary.as_ref())?;
-                Some(
-                    weekly_limit_status_line(window, Local::now())
-                        .spans
-                        .into_iter()
-                        .map(|span| span.content.into_owned())
-                        .collect(),
-                )
+                    .and_then(weekly_status_window)?;
+                let label = limit_label_for_window(window.window_minutes, is_secondary);
+                self.status_line_limit_display(Some(window), &label)
             }
             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
             StatusLineItem::ContextWindowSize => self
@@ -905,6 +887,102 @@ impl ChatWidget {
         truncated.push_str("...");
         truncated
     }
+}
+
+fn five_hour_status_window(
+    snapshot: &RateLimitSnapshotDisplay,
+) -> Option<(&RateLimitWindowDisplay, bool)> {
+    find_primary_codex_window(snapshot, "5h")
+        .or_else(|| secondary_window_with_label_when_weekly_is_available(snapshot, "5h"))
+        .or_else(|| non_weekly_primary_window(snapshot))
+        .or_else(|| non_weekly_secondary_window_when_primary_is_weekly(snapshot))
+}
+
+fn weekly_status_window(
+    snapshot: &RateLimitSnapshotDisplay,
+) -> Option<(&RateLimitWindowDisplay, bool)> {
+    find_codex_window(snapshot, "weekly")
+        .or_else(|| snapshot.secondary.as_ref().map(|window| (window, true)))
+}
+
+fn find_codex_window<'a>(
+    snapshot: &'a RateLimitSnapshotDisplay,
+    label: &str,
+) -> Option<(&'a RateLimitWindowDisplay, bool)> {
+    if let Some(primary) = snapshot.primary.as_ref()
+        && matches_window_label(primary, label)
+    {
+        return Some((primary, false));
+    }
+
+    if let Some(secondary) = snapshot.secondary.as_ref()
+        && matches_window_label(secondary, label)
+    {
+        return Some((secondary, true));
+    }
+
+    None
+}
+
+fn find_primary_codex_window<'a>(
+    snapshot: &'a RateLimitSnapshotDisplay,
+    label: &str,
+) -> Option<(&'a RateLimitWindowDisplay, bool)> {
+    let primary = snapshot.primary.as_ref()?;
+    if matches_window_label(primary, label) {
+        Some((primary, false))
+    } else {
+        None
+    }
+}
+
+fn secondary_window_with_label_when_weekly_is_available<'a>(
+    snapshot: &'a RateLimitSnapshotDisplay,
+    label: &str,
+) -> Option<(&'a RateLimitWindowDisplay, bool)> {
+    find_codex_window(snapshot, "weekly")?;
+
+    let secondary = snapshot.secondary.as_ref()?;
+    if matches_window_label(secondary, label) {
+        Some((secondary, true))
+    } else {
+        None
+    }
+}
+
+fn non_weekly_primary_window(
+    snapshot: &RateLimitSnapshotDisplay,
+) -> Option<(&RateLimitWindowDisplay, bool)> {
+    let primary = snapshot.primary.as_ref()?;
+    if matches_window_label(primary, "weekly") {
+        None
+    } else {
+        Some((primary, false))
+    }
+}
+
+fn non_weekly_secondary_window_when_primary_is_weekly(
+    snapshot: &RateLimitSnapshotDisplay,
+) -> Option<(&RateLimitWindowDisplay, bool)> {
+    let primary = snapshot.primary.as_ref()?;
+    if !matches_window_label(primary, "weekly") {
+        return None;
+    }
+
+    let secondary = snapshot.secondary.as_ref()?;
+    if matches_window_label(secondary, "weekly") {
+        None
+    } else {
+        Some((secondary, true))
+    }
+}
+
+fn matches_window_label(window: &RateLimitWindowDisplay, label: &str) -> bool {
+    window
+        .window_minutes
+        .and_then(get_limits_duration)
+        .as_deref()
+        == Some(label)
 }
 
 fn permissions_display(config: &Config) -> String {
